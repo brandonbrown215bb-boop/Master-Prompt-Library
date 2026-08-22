@@ -1,0 +1,50 @@
+# Python caches and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+coverage.xml
+htmlcov/
+
+# Node, editor, and OS caches
+node_modules/
+.npm/
+.yarn/
+.pnpm-store/
+.eslintcache
+.vscode/
+.idea/
+*.swp
+*.swo
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+
+# Derived indexes and local user/runtime state
+graphify-out/
+.local/
+local-data/
+runtime-data/
+user-data/
+.comfyui-user/
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary, log, and backup files
+*.log
+*.tmp
+*.bak
+*.temp
+*.backup
+
+# Generated test artifacts
+test-results/
+test-artifacts/
+artifacts/
+.artifacts/

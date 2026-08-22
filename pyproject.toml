@@ -1,0 +1,8 @@
+[project]
+name = "comfyui-master-prompt-library"
+version = "2.1.0"
+description = "A local-first ComfyUI custom node for reusable prompt components."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []

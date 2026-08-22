@@ -1,0 +1,66 @@
+{
+  "id": "master-prompt-library-core",
+  "pack_id": "master-prompt-library-core",
+  "version": 2,
+  "schema_version": 2,
+  "name": "Master Prompt Library Core",
+  "description": "Original reusable prompt components plus the credited Clio style snapshot.",
+  "total_entries": 401,
+  "category_counts": {
+    "Style": 281,
+    "Character": 24,
+    "Action": 24,
+    "Background": 24,
+    "Camera": 16,
+    "Lighting": 16,
+    "Mood": 16
+  },
+  "authors": [
+    {
+      "name": "Master Prompt Library contributors",
+      "role": "Original Character, Action, Background, Camera, Lighting, and Mood components",
+      "license": "MIT"
+    },
+    {
+      "name": "u/Dear-Spend-2865",
+      "role": "Author credited by the Clio Style Library for the 281 style descriptions",
+      "source": "Installed Clio Style Library styles.json"
+    }
+  ],
+  "sources": [
+    {
+      "name": "Clio Style Library",
+      "path": "custom_nodes/clio-style-node/styles.json",
+      "category": "Style",
+      "entry_count": 281,
+      "content_sha256": "08bfe902359f840a92d5fd3e9530bd2c49d1d82af5bc07de63dcd735f6bbf5a1",
+      "content_digest_algorithm": "SHA-256 over canonical UTF-8 JSON [{name,prompt}] records in source order",
+      "provenance": "The 281 style records are copied in source order with name, prompt, and existing UUID unchanged.",
+      "license": "The Clio README describes this community-shared prompt text as credited to u/Dear-Spend-2865 and does not claim it under the Clio code MIT license. This pack preserves that qualification and makes no relicensing claim."
+    },
+    {
+      "name": "Master Prompt Library original component set",
+      "path": "scripts/generate_seed_v2.py",
+      "category": "Character, Action, Background, Camera, Lighting, Mood",
+      "entry_count": 120,
+      "provenance": "Written for this pack as concise reusable component fragments; no remote corpus or third-party wildcard collection was imported.",
+      "license": "MIT, as original project content."
+    }
+  ],
+  "licensing": {
+    "code_and_original_components": "MIT License; see LICENSE.",
+    "clio_style_records": "Included with the attribution and qualification above. They are not claimed under the Master Prompt Library MIT license.",
+    "redistribution_note": "Redistributors must retain the Clio attribution and must not describe the style prose as original Master Prompt Library content."
+  },
+  "deterministic_ids": {
+    "algorithm": "UUID5",
+    "namespace": "6f7f6e79-0f7b-5c35-9b75-2a3dfb8f6d1f",
+    "entry_name_template": "master-prompt-library:v2:entry:<category-key>:<display-name>",
+    "category_name_template": "master-prompt-library:v2:category:<category-key>:<display-name>"
+  },
+  "images": {
+    "included": false,
+    "remote_urls": false,
+    "note": "All seed entries start with empty preview and generated-image galleries."
+  }
+}

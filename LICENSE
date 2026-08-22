@@ -1,0 +1,31 @@
+MIT License
+
+Copyright (c) 2026 Master Prompt Library contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+The style descriptions in seed_library.json and seed_library_v2.json were compiled
+and shared publicly by u/Dear-Spend-2865 (Reddit) as a wildcard set; they are included here with
+credit and are not claimed under this license.  This notice does not make any
+additional relicensing claim about that prompt data.
+
+The original reusable component prompts added for the v2 core pack (Character,
+Action, Background, Camera, Lighting, and Mood) are project-authored content
+and are included under this MIT license.  The v2 manifest and README preserve
+the separate Clio provenance and licensing qualification for the Style data.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

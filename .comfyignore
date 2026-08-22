@@ -1,0 +1,11 @@
+.git/
+.github/
+graphify-out/
+tests/
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.bak
+IMPLEMENTATION_PLAN.md
+V2_IMPLEMENTATION_PLAN.md
