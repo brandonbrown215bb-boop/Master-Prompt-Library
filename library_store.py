@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -39,6 +40,8 @@ MAX_CATEGORY_NAME_LENGTH = 80
 MAX_PROMPT_LENGTH = 20_000
 MAX_TAG_LENGTH = 80
 MAX_TAGS = 100
+MAX_LORA_NAME_LENGTH = 512
+MAX_LORAS_PER_ENTRY = 16
 
 _WRITE_LOCK = threading.RLock()
 _UNSET = object()
@@ -159,6 +162,34 @@ def _normalize_tags(value: Any) -> list[str]:
     if len(unique) > MAX_TAGS:
         raise ValidationError("too many tags")
     return sorted(unique.values(), key=lambda tag: (tag.casefold(), tag))
+
+
+def _normalize_loras(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_LORAS_PER_ENTRY:
+        raise ValidationError("entry LoRA attachments are invalid")
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise ValidationError("LoRA attachment must be an object")
+        name = _trim_text(raw.get("name"), "LoRA name", MAX_LORA_NAME_LENGTH)
+        key = name.casefold()
+        if key in seen:
+            raise ValidationError("duplicate LoRA attachment")
+        seen.add(key)
+        strengths: dict[str, float] = {}
+        for field in ("strength_model", "strength_clip"):
+            raw_strength = raw.get(field, 1.0)
+            if isinstance(raw_strength, bool) or not isinstance(raw_strength, (int, float)):
+                raise ValidationError(f"LoRA {field} must be a number")
+            strength = float(raw_strength)
+            if not math.isfinite(strength) or strength < -100.0 or strength > 100.0:
+                raise ValidationError(f"LoRA {field} is outside the supported range")
+            strengths[field] = strength
+        normalized.append({"name": name, **strengths})
+    return normalized
 
 
 def _validate_v2(document: Any, *, image_store: ImageStore | None = None, clear_missing_images: bool = False) -> dict[str, Any]:
@@ -295,6 +326,7 @@ def _validate_v2(document: Any, *, image_store: ImageStore | None = None, clear_
                 "name": entry_name,
                 "prompt": entry_prompt,
                 "tags": tags,
+                "loras": _normalize_loras(raw_entry.get("loras", [])),
                 "favorite": favorite,
                 "folder_id": folder_id,
                 "images": images,
@@ -506,6 +538,7 @@ class LibraryStore:
                     "name": old_entry["name"],
                     "prompt": old_entry["prompt"],
                     "tags": [],
+                    "loras": [],
                     "favorite": False,
                     "folder_id": None,
                     "images": images,
@@ -862,7 +895,7 @@ class LibraryStore:
             self._save(library)
             return copy.deepcopy(folder)
 
-    def create_entry(self, category: str, name: str, prompt: str, *, tags: Any = None, favorite: bool = False, folder_id: Any = None, entry_id: Any = None) -> dict[str, Any]:
+    def create_entry(self, category: str, name: str, prompt: str, *, tags: Any = None, loras: Any = None, favorite: bool = False, folder_id: Any = None, entry_id: Any = None) -> dict[str, Any]:
         with _WRITE_LOCK:
             library = self.ensure_library()
             if library.get("version") == V1_VERSION:
@@ -889,12 +922,12 @@ class LibraryStore:
                 raise ValidationError("entry folder is not in its category")
             if not isinstance(favorite, bool):
                 raise ValidationError("favorite must be boolean")
-            entry = {"id": entry_id, "name": name, "prompt": prompt, "tags": _normalize_tags(tags), "favorite": favorite, "folder_id": folder_id, "images": [], "primary_image_id": None}
+            entry = {"id": entry_id, "name": name, "prompt": prompt, "tags": _normalize_tags(tags), "loras": _normalize_loras(loras), "favorite": favorite, "folder_id": folder_id, "images": [], "primary_image_id": None}
             current["entries"].append(entry)
             self._save(library)
             return copy.deepcopy(entry)
 
-    def update_entry(self, entry_id: Any, *, name: str | None = None, prompt: str | None = None, category: str | None = None, tags: Any = None, favorite: bool | None = None, folder_id: Any = _UNSET, **kwargs: Any) -> dict[str, Any]:
+    def update_entry(self, entry_id: Any, *, name: str | None = None, prompt: str | None = None, category: str | None = None, tags: Any = None, loras: Any = _UNSET, favorite: bool | None = None, folder_id: Any = _UNSET, **kwargs: Any) -> dict[str, Any]:
         with _WRITE_LOCK:
             if category is None and "category_id" in kwargs:
                 category = kwargs["category_id"]
@@ -925,6 +958,8 @@ class LibraryStore:
                 raise ValidationError("favorite must be boolean")
             if tags is not None:
                 entry["tags"] = _normalize_tags(tags)
+            if loras is not _UNSET:
+                entry["loras"] = _normalize_loras(loras)
             if favorite is not None:
                 entry["favorite"] = favorite
             if folder_id is not _UNSET and folder_id is not None:

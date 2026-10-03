@@ -47,6 +47,18 @@ test("quick-picker pagination clamps to six rows and handles empty pages", () =>
   assert.deepEqual(paginateQuickPicker([], 99), { items: [], page: 0, pageCount: 1, total: 0, start: 0, end: 0 });
 });
 
+test("quick-picker keeps large categories bounded to one rendered page", () => {
+  const entries = Array.from({ length: 281 }, (_, index) => ({ id: `entry-${index}` }));
+  const page = paginateQuickPicker(entries, 12);
+  assert.equal(page.total, 281);
+  assert.equal(page.page, 12);
+  assert.equal(page.pageCount, 47);
+  assert.equal(page.start, 72);
+  assert.equal(page.end, 78);
+  assert.equal(page.items.length, QUICK_PICKER_PAGE_SIZE);
+  assert.ok(page.items.length < entries.length);
+});
+
 test("quick-picker filters the active category by text without leaking other categories", () => {
   assert.deepEqual(quickPickerEntries(library, "style", "paper").entries.map((entry) => entry.id), ["s1", "s3"]);
   assert.deepEqual(quickPickerEntries(library, "character", "paper").entries, []);
@@ -101,6 +113,15 @@ test("quick-picker keyboard navigation uses 2D grid columns and global boundarie
   assert.equal(navigateQuickPickerIndex(0, "ArrowDown", 0, { columns: 3 }), -1);
 });
 
+test("quick-picker paging navigation crosses rendered page boundaries coherently", () => {
+  const options = { columns: 3, pageSize: QUICK_PICKER_PAGE_SIZE };
+  assert.equal(navigateQuickPickerIndex(5, "PageDown", 281, options), 11);
+  assert.equal(navigateQuickPickerIndex(11, "PageDown", 281, options), 17);
+  assert.equal(navigateQuickPickerIndex(6, "PageUp", 281, options), 0);
+  assert.equal(navigateQuickPickerIndex(17, "Home", 281, options), 0);
+  assert.equal(navigateQuickPickerIndex(17, "End", 281, options), 280);
+});
+
 test("quick-picker refreshes only on collapsed-to-expanded transitions", () => {
   assert.equal(shouldRefreshQuickPickerOnExpand(false, true), true);
   assert.equal(shouldRefreshQuickPickerOnExpand(true, true), false);
@@ -110,6 +131,7 @@ test("quick-picker refreshes only on collapsed-to-expanded transitions", () => {
 
 test("quick-picker wiring is idempotent, fallback-safe, and does not write component order", () => {
   const source = readFileSync(new URL("../web/prompt_library_quick_picker.mjs", import.meta.url), "utf8");
+  const styles = readFileSync(new URL("../web/prompt_library_quick_picker.css", import.meta.url), "utf8");
   const entry = readFileSync(new URL("../web/prompt_library_v2.js", import.meta.url), "utf8");
   assert.match(source, /node\.addDOMWidget\(/);
   assert.match(source, /node\.__mpl2QuickPicker/);
@@ -123,9 +145,24 @@ test("quick-picker wiring is idempotent, fallback-safe, and does not write compo
   assert.match(source, /await this\.loadLibrary\(\)/);
   assert.match(source, /if \(this\.loading\) return;/);
   assert.match(source, /markLayoutDirty\(\)/);
+  assert.match(source, /aria-multiselectable.*true/);
+  assert.match(source, /Previous/);
+  assert.match(source, /Next/);
+  assert.match(source, /role.*status.*aria-live.*polite/);
+  assert.match(source, /this\.page\s*=\s*0/);
+  assert.match(source, /paginateQuickPicker\(entries, this\.page/);
+  assert.match(source, /for \(const \[pageIndex, entry\] of pagination\.items\.entries\(\)\)/);
+  assert.match(source, /this\.page = Math\.floor\(nextIndex \/ pageSize\)/);
+  assert.match(source, /this\.resetView\(\)/);
+  assert.match(source, /serialize: false/);
+  assert.match(source, /widget\.value = serialized/);
   assert.doesNotMatch(source, /component_order/);
+  assert.match(styles, /\.mpl2-quick-tile-label[\s\S]*font-size:\s*11px/);
+  assert.match(styles, /\.mpl2-quick-snippet[\s\S]*font-size:\s*11px/);
+  assert.doesNotMatch(styles, /max-height:\s*195px/);
+  assert.match(styles, /\.mpl2-quick-page-button[\s\S]*min-height:\s*24px/);
+  assert.match(styles, /\.mpl2-quick-clear-search[\s\S]*width:\s*24px[\s\S]*height:\s*24px/);
   assert.match(entry, /installQuickPicker\(node/);
   assert.match(entry, /node\.__mpl2QuickPicker\?\.syncFromNode/);
   assert.match(entry, /fetchLibrary: \(\) => requestJSON\(`\$\{API_BASE\}\/library`\)/);
 });
-

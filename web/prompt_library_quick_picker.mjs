@@ -6,7 +6,7 @@ import {
   normalizeSelectionState,
   paginateEntries,
   serializeSelectionState,
-} from "./library_v2_logic.mjs";
+} from "./library_v2_logic.mjs?v=2.1.0-lora1";
 
 export const QUICK_PICKER_PAGE_SIZE = 6;
 export const QUICK_PICKER_GRID_COLUMNS = 3;
@@ -44,8 +44,8 @@ export function quickPickerEntries(library, categoryId, query = "") {
 }
 
 /** Return one clamped quick-picker page (kept for backwards compatibility). */
-export function paginateQuickPicker(entries, requestedPage = 0) {
-  return paginateEntries(entries, requestedPage, QUICK_PICKER_PAGE_SIZE);
+export function paginateQuickPicker(entries, requestedPage = 0, pageSize = QUICK_PICKER_PAGE_SIZE) {
+  return paginateEntries(entries, requestedPage, pageSize);
 }
 
 /** Navigate a 2D tile grid or linear index with column awareness and boundary wrapping. */
@@ -129,6 +129,7 @@ export class QuickPickerController {
     this.errorMessage = "";
     this.activeCategory = "";
     this.query = "";
+    this.page = 0;
     this.cursor = 0;
 
     this.root = domElement("div", { className: "mpl2-quick-root" });
@@ -151,7 +152,24 @@ export class QuickPickerController {
     this.controls.append(this.categoryLabel, this.searchLabel);
 
     this.state = domElement("div", { className: "mpl2-quick-state", role: "status", "aria-live": "polite" });
-    this.tiles = domElement("div", { className: "mpl2-quick-tiles", role: "listbox", "aria-label": "Component tiles" });
+    this.tiles = domElement("div", { className: "mpl2-quick-tiles", role: "listbox", "aria-label": "Component tiles", "aria-multiselectable": "true" });
+    this.pagination = domElement("div", { className: "mpl2-quick-pagination", "aria-label": "Quick picker pages" });
+    this.previousPageButton = domElement("button", {
+      className: "mpl2-quick-page-button",
+      type: "button",
+      textContent: "Previous",
+      title: "Previous page",
+      "aria-label": "Previous quick-picker page",
+    });
+    this.pageStatus = domElement("span", { className: "mpl2-quick-page-status", role: "status", "aria-live": "polite" });
+    this.nextPageButton = domElement("button", {
+      className: "mpl2-quick-page-button",
+      type: "button",
+      textContent: "Next",
+      title: "Next page",
+      "aria-label": "Next quick-picker page",
+    });
+    this.pagination.append(this.previousPageButton, this.pageStatus, this.nextPageButton);
     this.snippet = domElement("div", { className: "mpl2-quick-snippet", "aria-live": "polite", textContent: "Hover or focus a component to inspect prompt" });
 
     // Isolate mousewheel scrolling so LiteGraph does not zoom the canvas while browsing tiles
@@ -159,26 +177,29 @@ export class QuickPickerController {
       event.stopPropagation();
     }, { passive: true });
 
-    this.panel.append(this.controls, this.state, this.tiles, this.snippet);
+    this.panel.append(this.controls, this.state, this.tiles, this.pagination, this.snippet);
     this.root.append(this.toggle, this.panel);
 
     this.categorySelect.addEventListener("change", () => {
       this.activeCategory = this.categorySelect.value;
-      this.cursor = 0;
+      this.resetView();
       this.renderResults();
     });
     this.searchInput.addEventListener("input", () => {
       this.query = this.searchInput.value;
-      this.cursor = 0;
+      this.resetView();
       this.renderResults();
     });
     this.clearSearchBtn.addEventListener("click", () => {
       this.searchInput.value = "";
       this.query = "";
-      this.cursor = 0;
+      this.resetView();
       this.renderResults();
       this.searchInput.focus();
     });
+
+    this.previousPageButton.addEventListener("click", () => this.changePage(-1));
+    this.nextPageButton.addEventListener("click", () => this.changePage(1));
 
     this.render();
   }
@@ -198,6 +219,11 @@ export class QuickPickerController {
 
   categories() {
     return array(this.library?.categories);
+  }
+
+  resetView() {
+    this.page = 0;
+    this.cursor = 0;
   }
 
   readSelection() {
@@ -236,7 +262,7 @@ export class QuickPickerController {
       this.selection = this.readSelection();
       const categories = this.categories();
       this.activeCategory = categories.some((category) => category.id === this.activeCategory) ? this.activeCategory : (categories[0]?.id || "");
-      this.cursor = 0;
+      this.resetView();
     } catch (error) {
       this.errorMessage = errorText(error);
     } finally {
@@ -248,14 +274,26 @@ export class QuickPickerController {
 
   clampView() {
     const { entries } = quickPickerEntries(this.library, this.activeCategory, this.query);
-    if (!entries.length) this.cursor = 0;
-    else this.cursor = Math.min(Math.max(Number(this.cursor) || 0, 0), entries.length - 1);
+    const pagination = paginateQuickPicker(entries, this.page, this.pageSize());
+    this.page = pagination.page;
+    if (!entries.length) {
+      this.cursor = 0;
+      return;
+    }
+    this.cursor = Math.min(Math.max(Number(this.cursor) || 0, 0), entries.length - 1);
+    if (this.cursor < pagination.start || this.cursor >= pagination.end) this.cursor = pagination.start;
   }
 
   computeGridColumns() {
     const width = this.tiles?.clientWidth || 0;
     if (width > 0) return Math.max(1, Math.floor((width + 6) / 82));
     return QUICK_PICKER_GRID_COLUMNS;
+  }
+
+  pageSize() {
+    // Keep pages row-complete when a host gives the widget more width, while
+    // retaining the six-tile default used by the pure helpers and tests.
+    return Math.max(QUICK_PICKER_PAGE_SIZE, this.computeGridColumns() * 2);
   }
 
   focusCursor() {
@@ -284,10 +322,22 @@ export class QuickPickerController {
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End"].includes(key)) return;
     const { entries } = quickPickerEntries(this.library, this.activeCategory, this.query);
     const columns = this.computeGridColumns();
-    const nextIndex = navigateQuickPickerIndex(globalIndex, key, entries.length, { columns, pageSize: columns * 2 });
+    const pageSize = this.pageSize();
+    const nextIndex = navigateQuickPickerIndex(globalIndex, key, entries.length, { columns, pageSize });
     if (nextIndex < 0) return;
     event.preventDefault();
     this.cursor = nextIndex;
+    this.page = Math.floor(nextIndex / pageSize);
+    this.renderResults();
+    this.focusCursor();
+  }
+
+  changePage(offset) {
+    const { entries } = quickPickerEntries(this.library, this.activeCategory, this.query);
+    const pagination = paginateQuickPicker(entries, this.page + Number(offset || 0), this.pageSize());
+    if (!entries.length || pagination.page === this.page) return;
+    this.page = pagination.page;
+    this.cursor = pagination.start;
     this.renderResults();
     this.focusCursor();
   }
@@ -332,6 +382,7 @@ export class QuickPickerController {
     if (!this.expanded) return;
     this.renderCategoryOptions();
     clear(this.tiles);
+    this.pagination.hidden = true;
     if (this.loading) {
       this.state.textContent = "Loading library…";
       this.snippet.textContent = "";
@@ -349,10 +400,14 @@ export class QuickPickerController {
     }
 
     const { entries } = quickPickerEntries(this.library, this.activeCategory, this.query);
+    const pagination = paginateQuickPicker(entries, this.page, this.pageSize());
+    this.page = pagination.page;
     this.cursor = entries.length ? Math.min(Math.max(this.cursor, 0), entries.length - 1) : 0;
+    if (entries.length && (this.cursor < pagination.start || this.cursor >= pagination.end)) this.cursor = pagination.start;
     const selected = new Set(selectedForCategory(this.selection, this.activeCategory));
 
-    for (const [globalIndex, entry] of entries.entries()) {
+    for (const [pageIndex, entry] of pagination.items.entries()) {
+      const globalIndex = pagination.start + pageIndex;
       const isSelected = selected.has(entry.id);
       const tile = domElement("button", {
         className: "mpl2-quick-tile",
@@ -415,7 +470,16 @@ export class QuickPickerController {
       this.tiles.appendChild(tile);
     }
 
-    this.state.textContent = entries.length ? `${entries.length} component${entries.length === 1 ? "" : "s"}` : "No matches.";
+    if (entries.length) {
+      this.pagination.hidden = false;
+      this.previousPageButton.disabled = pagination.page <= 0;
+      this.nextPageButton.disabled = pagination.page >= pagination.pageCount - 1;
+      this.pageStatus.textContent = `Page ${pagination.page + 1} of ${pagination.pageCount} · Showing ${pagination.start + 1}–${pagination.end} of ${pagination.total}`;
+      this.state.textContent = `${entries.length} component${entries.length === 1 ? "" : "s"}`;
+    } else {
+      this.pageStatus.textContent = "No pages";
+      this.state.textContent = "No matches.";
+    }
     if (!entries.length) this.snippet.textContent = "";
   }
 
@@ -447,4 +511,3 @@ export function installQuickPicker(node, options = {}) {
     return null;
   }
 }
-

@@ -83,11 +83,26 @@ export function normalizeEntry(entry) {
   if (legacyImage && !images.length) images.push(legacyImage);
   const imageIds = new Set(images.map((image) => image.id));
   const primary = trimmed(source.primary_image_id);
+  const loraSeen = new Set();
+  const loras = array(source.loras).map((lora) => {
+    const item = object(lora);
+    const name = trimmed(item.name);
+    const strengthModel = Number(item.strength_model);
+    const strengthClip = Number(item.strength_clip);
+    if (!name || loraSeen.has(lower(name))) return null;
+    loraSeen.add(lower(name));
+    return {
+      name,
+      strength_model: Number.isFinite(strengthModel) ? Math.max(-100, Math.min(100, strengthModel)) : 1,
+      strength_clip: Number.isFinite(strengthClip) ? Math.max(-100, Math.min(100, strengthClip)) : 1,
+    };
+  }).filter(Boolean);
   return {
     id: trimmed(source.id),
     name: text(source.name),
     prompt: text(source.prompt),
     tags: normalizeTags(source.tags),
+    loras,
     favorite: source.favorite === true,
     folder_id: trimmed(source.folder_id) || null,
     images,
@@ -451,4 +466,248 @@ export function parsePromptSections(prompt, categoryNames = []) {
     sections[matched] = content;
   }
   return sections;
+}
+
+/**
+ * Extraction requests capture the state object they started against.  The
+ * modal replaces this object when the user backs out or reopens the flow, so
+ * identity is a small, dependency-free request epoch.
+ */
+export function extractionRequestToken(state) {
+  return state;
+}
+
+export function isCurrentExtractionRequest(state, token) {
+  return state === token;
+}
+
+/** Execute an async extraction continuation only for the state that started it. */
+export function runIfCurrentExtractionRequest(state, token, callback) {
+  if (!isCurrentExtractionRequest(state, token) || typeof callback !== "function") return false;
+  callback();
+  return true;
+}
+
+export function visionExtractionRequestFields(state) {
+  const source = object(state);
+  return {
+    api_endpoint: text(source.apiEndpoint),
+    api_key: text(source.apiKey),
+    api_model: text(source.apiModel),
+    force_vision: "true",
+  };
+}
+
+export const STRUCTURED_EXTRACTION_FIELD_ORDER = Object.freeze([
+  "positive_prompt",
+  "style",
+  "character",
+  "clothing",
+  "action",
+  "background",
+  "camera",
+  "lighting",
+  "mood",
+]);
+
+export const STRUCTURED_EXTRACTION_FIELD_LABELS = Object.freeze({
+  positive_prompt: "Positive Prompt",
+  style: "Style",
+  character: "Character",
+  clothing: "Clothing",
+  action: "Action",
+  background: "Background",
+  camera: "Camera",
+  lighting: "Lighting",
+  mood: "Mood",
+});
+
+/**
+ * Consume only the backend-owned structured property.  The model message is
+ * never reparsed in the browser; malformed or empty structured data simply
+ * falls back to the legacy prompt/sections fields.
+ */
+export function normalizeStructuredExtraction(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value;
+  const structured = {};
+  let hasComponent = false;
+  for (const key of STRUCTURED_EXTRACTION_FIELD_ORDER) {
+    const component = trimmed(source[key]);
+    structured[key] = component;
+    if (component) hasComponent = true;
+  }
+  if (!hasComponent) return null;
+  structured.confidence = typeof source.confidence === "number" && Number.isFinite(source.confidence)
+    ? source.confidence
+    : null;
+  return structured;
+}
+
+export function normalizeExtractionDrafts(structured, fallbackPrompt = "") {
+  const normalized = normalizeStructuredExtraction(structured);
+  const prompt = trimmed(fallbackPrompt);
+  if (!normalized) return { positive_prompt: prompt };
+  const drafts = {};
+  for (const key of STRUCTURED_EXTRACTION_FIELD_ORDER) drafts[key] = trimmed(normalized[key]);
+  if (!drafts.positive_prompt && prompt) drafts.positive_prompt = prompt;
+  return drafts;
+}
+
+function extractionDraftMap(state) {
+  const source = object(state);
+  if (source.extractedFieldDrafts && typeof source.extractedFieldDrafts === "object" && !Array.isArray(source.extractedFieldDrafts)) {
+    return source.extractedFieldDrafts;
+  }
+  return normalizeExtractionDrafts(source.structured, source.prompt);
+}
+
+/** Return non-empty fields in the fixed backend contract order. */
+export function extractionFieldOptions(state) {
+  const source = object(state);
+  const drafts = extractionDraftMap(source);
+  const structured = normalizeStructuredExtraction(source.structured);
+  const originallyAvailable = structured
+    ? new Set(STRUCTURED_EXTRACTION_FIELD_ORDER.filter((key) => trimmed(structured[key])))
+    : null;
+  return STRUCTURED_EXTRACTION_FIELD_ORDER
+    .map((key) => ({ key, label: STRUCTURED_EXTRACTION_FIELD_LABELS[key], value: text(drafts[key]) }))
+    .filter((field) => originallyAvailable ? originallyAvailable.has(field.key) : field.value.trim());
+}
+
+/** Return the available extracted fields currently selected for library saving. */
+export function selectedExtractionFields(state) {
+  const source = object(state);
+  const available = new Set(extractionFieldOptions(source).map((field) => field.key));
+  const requested = Array.isArray(source.selectedExtractionFields)
+    ? source.selectedExtractionFields
+    : [...available];
+  const selected = new Set(requested.filter((key) => available.has(key)));
+  return STRUCTURED_EXTRACTION_FIELD_ORDER.filter((key) => selected.has(key));
+}
+
+/** Toggle one save selection without changing the field currently being edited. */
+export function toggleExtractionFieldSelection(state, field, checked) {
+  const source = object(state);
+  const selected = new Set(selectedExtractionFields(source));
+  if (checked) selected.add(field);
+  else selected.delete(field);
+  return {
+    ...source,
+    selectedExtractionFields: STRUCTURED_EXTRACTION_FIELD_ORDER.filter((key) => selected.has(key)),
+  };
+}
+
+/** Resolve a structured field to its destination category. */
+export function extractionCategoryForField(field, categories, targetCategory = "") {
+  const available = array(categories);
+  if (field === "positive_prompt") {
+    return available.find((category) => category.id === targetCategory) || null;
+  }
+  const wanted = new Set([field, STRUCTURED_EXTRACTION_FIELD_LABELS[field]].map(lower).filter(Boolean));
+  return available.find((category) => [category.id, category.key, category.name].some((value) => wanted.has(lower(value)))) || null;
+}
+
+/** Build deterministic create-entry operations for every selected extracted field. */
+export function extractionSavePlan(state, categories) {
+  const source = object(state);
+  const options = new Map(extractionFieldOptions(source).map((field) => [field.key, field]));
+  const selected = selectedExtractionFields(source);
+  const baseName = trimmed(source.suggestedName) || "Extracted Prompt";
+  const useFieldSuffix = selected.length > 1;
+  const entries = [];
+  const unmatched = [];
+  const empty = [];
+
+  for (const fieldKey of selected) {
+    const field = options.get(fieldKey);
+    const prompt = trimmed(field?.value);
+    if (!prompt) {
+      empty.push({ field: fieldKey, label: STRUCTURED_EXTRACTION_FIELD_LABELS[fieldKey] });
+      continue;
+    }
+    const category = extractionCategoryForField(fieldKey, categories, source.targetCategory);
+    if (!category) {
+      unmatched.push({ field: fieldKey, label: STRUCTURED_EXTRACTION_FIELD_LABELS[fieldKey] });
+      continue;
+    }
+    entries.push({
+      field: fieldKey,
+      name: useFieldSuffix ? `${baseName} — ${STRUCTURED_EXTRACTION_FIELD_LABELS[fieldKey]}` : baseName,
+      prompt,
+      category: category.id,
+      folder_id: fieldKey === "positive_prompt" ? (trimmed(source.folderId) || null) : null,
+    });
+  }
+
+  return { entries, unmatched, empty };
+}
+
+export function selectedExtractionDraft(state) {
+  const source = object(state);
+  const drafts = extractionDraftMap(source);
+  const selected = STRUCTURED_EXTRACTION_FIELD_ORDER.includes(source.selectedExtractedField)
+    ? source.selectedExtractedField
+    : "positive_prompt";
+  return text(drafts[selected] ?? (selected === "positive_prompt" ? source.prompt : ""));
+}
+
+/** Select an available extracted field and expose its draft through prompt. */
+export function selectExtractionField(state, field) {
+  const source = object(state);
+  const options = extractionFieldOptions(source);
+  const requested = STRUCTURED_EXTRACTION_FIELD_ORDER.includes(field) ? field : "positive_prompt";
+  const selected = options.some((option) => option.key === requested) ? requested : (options[0]?.key || requested);
+  const drafts = extractionDraftMap(source);
+  return {
+    ...source,
+    selectedExtractedField: selected,
+    prompt: text(drafts[selected] ?? (selected === "positive_prompt" ? source.prompt : "")),
+  };
+}
+
+/** Update only the selected extracted field while retaining every other draft. */
+export function updateExtractionFieldDraft(state, value, field = null) {
+  const source = object(state);
+  const selected = STRUCTURED_EXTRACTION_FIELD_ORDER.includes(field || source.selectedExtractedField)
+    ? (field || source.selectedExtractedField)
+    : "positive_prompt";
+  const drafts = { ...extractionDraftMap(source), [selected]: text(value) };
+  return {
+    ...source,
+    selectedExtractedField: selected,
+    extractedFieldDrafts: drafts,
+    prompt: text(value),
+  };
+}
+
+/** Apply a successful extract response without inventing the source client-side. */
+export function applyExtractionResponse(state, response, { filename = "", categoryNames = [], categories = [], requirePrompt = false } = {}) {
+  const source = object(response);
+  const structured = normalizeStructuredExtraction(source.structured);
+  const extractedFieldDrafts = normalizeExtractionDrafts(structured, source.prompt);
+  const positivePrompt = trimmed(extractedFieldDrafts.positive_prompt);
+  if (requirePrompt && !positivePrompt) throw new Error("Vision extraction returned an empty prompt.");
+  const options = extractionFieldOptions({ extractedFieldDrafts });
+  const selectedExtractedField = options[0]?.key || "positive_prompt";
+  const selectedExtractionFields = array(categories).length
+    ? options
+      .filter((field) => extractionCategoryForField(field.key, categories, object(state).targetCategory))
+      .map((field) => field.key)
+    : options.map((field) => field.key);
+  const prompt = text(extractedFieldDrafts[selectedExtractedField]).trim();
+  const sections = source.sections && typeof source.sections === "object" && !Array.isArray(source.sections)
+    ? source.sections
+    : parsePromptSections(positivePrompt, categoryNames);
+  return {
+    ...object(state),
+    prompt,
+    structured,
+    selectedExtractedField,
+    selectedExtractionFields,
+    extractedFieldDrafts,
+    source: trimmed(source.source) || "none",
+    suggestedName: trimmed(source.suggested_name) || suggestEntryName(positivePrompt, filename),
+    sections,
+  };
 }

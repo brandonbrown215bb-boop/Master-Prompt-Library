@@ -7,28 +7,44 @@ import {
   PROMPT_TOKEN,
   availableTags,
   buildAssembledPrompt,
+  applyExtractionResponse,
+  extractionCategoryForField,
+  extractionFieldOptions,
+  extractionSavePlan,
   defaultComponentOrder,
   filterEntriesV2,
   galleryState,
   importPreviewSummary,
+  extractionRequestToken,
+  isCurrentExtractionRequest,
+  runIfCurrentExtractionRequest,
   moveByOffset,
   navigateCatalogIndex,
   normalizeComponentOrder,
+  normalizeExtractionDrafts,
   normalizeImportMapping,
   normalizeLibraryPayload,
   normalizeSelectionState,
   normalizeTags,
+  normalizeStructuredExtraction,
   paginateEntries,
   reorderIds,
   selectImportFiles,
   selectImportSource,
+  selectExtractionField,
+  selectedExtractionFields,
   serializeComponentOrder,
   serializeSelectionState,
   setGalleryPrimary,
+  selectedExtractionDraft,
   staleSelectionIds,
   cleanPositivePrompt,
   suggestEntryName,
   parsePromptSections,
+  STRUCTURED_EXTRACTION_FIELD_ORDER,
+  updateExtractionFieldDraft,
+  toggleExtractionFieldSelection,
+  visionExtractionRequestFields,
 } from "../web/library_v2_logic.mjs";
 
 const library = {
@@ -37,7 +53,7 @@ const library = {
     {
       id: "style", key: "style", name: "Style", protected: true, folders: [{ id: "f1", name: "Ink" }],
       entries: [
-        { id: "s1", name: "Warm Ink", prompt: "paper grain", tags: ["ink", "Portrait", "ink"], favorite: true, folder_id: "f1", images: [{ id: "p1", kind: "preview" }, { id: "g1", kind: "generated" }], primary_image_id: "p1" },
+        { id: "s1", name: "Warm Ink", prompt: "paper grain", tags: ["ink", "Portrait", "ink"], loras: [{ name: " styles/ink.safetensors ", strength_model: 0.8, strength_clip: 0.65 }, { name: "STYLES/INK.SAFETENSORS", strength_model: 2, strength_clip: 2 }], favorite: true, folder_id: "f1", images: [{ id: "p1", kind: "preview" }, { id: "g1", kind: "generated" }], primary_image_id: "p1" },
         { id: "s2", name: "Night Glass", prompt: "blue reflection", tags: ["night"], favorite: false, folder_id: null, images: [] },
       ],
     },
@@ -94,6 +110,7 @@ test("normalization deduplicates tags, preserves IDs, and fills protected catego
   assert.deepEqual(normalizeTags([" Portrait ", "ink", "INK", "portrait"]), ["ink", "Portrait"]);
   assert.deepEqual(result.categories.map((category) => category.id), ["style", "character", "custom", "action", "background"]);
   assert.deepEqual(result.categories[0].entries[0].tags, ["ink", "Portrait"]);
+  assert.deepEqual(result.categories[0].entries[0].loras, [{ name: "styles/ink.safetensors", strength_model: 0.8, strength_clip: 0.65 }]);
   assert.equal(result.categories[0].entries[0].primary_image_id, "p1");
 });
 
@@ -225,6 +242,174 @@ test("modal wires extract image button, dropzone, and extraction handler", () =>
   assert.match(source, /applyExtractedToNode/);
 });
 
+test("structured extraction normalizes component fields in canonical order and keeps confidence metadata", () => {
+  const structured = normalizeStructuredExtraction({
+    positive_prompt: "  A quiet portrait  ",
+    style: "editorial ink",
+    character: "traveler",
+    clothing: "",
+    action: "walking",
+    background: "misty hills",
+    camera: "85mm",
+    lighting: "soft light",
+    mood: "reflective",
+    confidence: 0.84,
+    ignored: "not a selectable field",
+  });
+  assert.deepEqual(Object.keys(structured), [...STRUCTURED_EXTRACTION_FIELD_ORDER, "confidence"]);
+  assert.equal(structured.positive_prompt, "A quiet portrait");
+  assert.equal(structured.clothing, "");
+  assert.equal(structured.confidence, 0.84);
+  assert.deepEqual(extractionFieldOptions({ structured, extractedFieldDrafts: normalizeExtractionDrafts(structured) }).map((field) => field.key), [
+    "positive_prompt", "style", "character", "action", "background", "camera", "lighting", "mood",
+  ]);
+});
+
+test("structured extraction edits stay with their field while switching drafts", () => {
+  const state = applyExtractionResponse({ prompt: "", source: "", suggestedName: "", sections: {} }, {
+    prompt: "A quiet portrait",
+    source: "vision",
+    structured: {
+      positive_prompt: "A quiet portrait",
+      style: "editorial ink",
+      character: "traveler",
+      clothing: "",
+      action: "walking",
+      background: "misty hills",
+      camera: "",
+      lighting: "soft light",
+      mood: "reflective",
+      confidence: 0.91,
+    },
+  });
+  const editedStyle = updateExtractionFieldDraft(state, "", "style");
+  assert.equal(selectedExtractionDraft(editedStyle), "");
+  assert.ok(extractionFieldOptions(editedStyle).some((field) => field.key === "style"));
+  assert.equal(extractionFieldOptions(editedStyle).find((field) => field.key === "style")?.value, "");
+  const character = selectExtractionField(editedStyle, "character");
+  assert.equal(character.prompt, "traveler");
+  const styleAgain = selectExtractionField(character, "style");
+  assert.equal(styleAgain.prompt, "");
+  assert.equal(styleAgain.extractedFieldDrafts.style, "");
+  assert.equal(styleAgain.extractedFieldDrafts.character, "traveler");
+  assert.deepEqual(selectedExtractionFields(styleAgain), [
+    "positive_prompt", "style", "character", "action", "background", "lighting", "mood",
+  ]);
+});
+
+test("extracted fields can be selected independently from the active editor", () => {
+  const state = {
+    selectedExtractedField: "character",
+    selectedExtractionFields: ["positive_prompt", "character", "mood"],
+    extractedFieldDrafts: {
+      positive_prompt: "full prompt",
+      character: "traveler",
+      mood: "reflective",
+    },
+  };
+  const withoutCharacter = toggleExtractionFieldSelection(state, "character", false);
+  assert.equal(withoutCharacter.selectedExtractedField, "character");
+  assert.deepEqual(selectedExtractionFields(withoutCharacter), ["positive_prompt", "mood"]);
+  assert.deepEqual(selectedExtractionFields(toggleExtractionFieldSelection(withoutCharacter, "character", true)), [
+    "positive_prompt", "character", "mood",
+  ]);
+});
+
+test("structured extraction initially checks only fields with real destinations", () => {
+  const state = applyExtractionResponse({ targetCategory: "style" }, {
+    prompt: "full prompt",
+    source: "vision",
+    structured: {
+      positive_prompt: "full prompt",
+      style: "anime",
+      character: "traveler",
+      clothing: "black coat",
+    },
+  }, {
+    categories: [
+      { id: "style", key: "style", name: "Style" },
+      { id: "character", key: "character", name: "Character" },
+    ],
+  });
+  assert.deepEqual(selectedExtractionFields(state), ["positive_prompt", "style", "character"]);
+});
+
+test("multi-field extraction save plan routes matching fields and reports missing categories", () => {
+  const categories = [
+    { id: "style", key: "style", name: "Style", entries: [] },
+    { id: "character", key: "character", name: "Character", entries: [] },
+    { id: "custom-mood", key: null, name: "Mood", entries: [] },
+  ];
+  const state = {
+    suggestedName: "Molly",
+    targetCategory: "style",
+    folderId: "portraits",
+    selectedExtractionFields: ["positive_prompt", "character", "clothing", "mood"],
+    extractedFieldDrafts: {
+      positive_prompt: "full prompt",
+      character: "blonde twin tails",
+      clothing: "black sleeveless top",
+      mood: "tense",
+    },
+  };
+  assert.equal(extractionCategoryForField("mood", categories, "style")?.id, "custom-mood");
+  const plan = extractionSavePlan(state, categories);
+  assert.deepEqual(plan.entries, [
+    { field: "positive_prompt", name: "Molly — Positive Prompt", prompt: "full prompt", category: "style", folder_id: "portraits" },
+    { field: "character", name: "Molly — Character", prompt: "blonde twin tails", category: "character", folder_id: null },
+    { field: "mood", name: "Molly — Mood", prompt: "tense", category: "custom-mood", folder_id: null },
+  ]);
+  assert.deepEqual(plan.unmatched, [{ field: "clothing", label: "Clothing" }]);
+  assert.deepEqual(plan.empty, []);
+});
+
+test("single-field extraction preserves the existing entry name", () => {
+  const plan = extractionSavePlan({
+    suggestedName: "Molly",
+    targetCategory: "character",
+    selectedExtractionFields: ["positive_prompt"],
+    extractedFieldDrafts: { positive_prompt: "full prompt" },
+  }, [{ id: "character", key: "character", name: "Character", entries: [] }]);
+  assert.equal(plan.entries[0]?.name, "Molly");
+});
+
+test("metadata extraction keeps the backend source and vision requests carry explicit intent", () => {
+  const state = { prompt: "", source: "", suggestedName: "", sections: {} };
+  const metadata = applyExtractionResponse(state, {
+    prompt: "embedded prompt",
+    source: "metadata",
+    suggested_name: "Embedded",
+  }, { filename: "image.png" });
+  assert.equal(metadata.prompt, "embedded prompt");
+  assert.equal(metadata.source, "metadata");
+  assert.equal(metadata.suggestedName, "Embedded");
+  assert.equal(metadata.structured, null);
+  assert.equal(metadata.selectedExtractedField, "positive_prompt");
+  assert.deepEqual(metadata.extractedFieldDrafts, { positive_prompt: "embedded prompt" });
+  assert.deepEqual(extractionFieldOptions(metadata).map((field) => field.key), ["positive_prompt"]);
+  assert.deepEqual(visionExtractionRequestFields({ apiEndpoint: "https://example.test", apiKey: "secret", apiModel: "vision-model" }), {
+    api_endpoint: "https://example.test",
+    api_key: "secret",
+    api_model: "vision-model",
+    force_vision: "true",
+  });
+});
+
+test("vision extraction rejects an empty response and stale request tokens", () => {
+  const state = { prompt: "old", source: "metadata", suggestedName: "Old", sections: {} };
+  assert.throws(() => applyExtractionResponse(state, { prompt: "  ", source: "vision" }, { requirePrompt: true }), /empty prompt/);
+  const token = extractionRequestToken(state);
+  assert.equal(isCurrentExtractionRequest(state, token), true);
+  assert.equal(isCurrentExtractionRequest({ ...state }, token), false);
+
+  const events = [];
+  const replaced = { ...state };
+  assert.equal(runIfCurrentExtractionRequest(replaced, token, () => events.push("stale")), false);
+  assert.deepEqual(events, []);
+  assert.equal(runIfCurrentExtractionRequest(state, token, () => events.push("current")), true);
+  assert.deepEqual(events, ["current"]);
+});
+
 test("buildAssembledPrompt deterministically formats ordered multi-component prompts", () => {
   const categories = normalizeLibraryPayload(library).library.categories;
   const selection = {
@@ -274,4 +459,3 @@ test("v2 CSS tokens implement WCAG AA contrast and in-modal subdialog layout", (
   assert.match(styles, /\.mpl2-assembled-box/);
   assert.match(styles, /@media\s*\(forced-colors:\s*active\)/);
 });
-

@@ -2,21 +2,57 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import json
+from pathlib import Path
 from typing import Any
 
 try:
     from .library_store import CATEGORIES, NONE_SELECTION, LibraryStore, ValidationError, create_default_store
-    from .image_extractor import clean_positive_prompt, extract_prompt_from_metadata, parse_prompt_sections, query_vision_api
+    from .image_extractor import (
+        clean_positive_prompt,
+        extract_prompt_from_metadata,
+        parse_prompt_sections,
+        parse_structured_vision_response,
+        query_vision_api,
+        structured_vision_to_sections,
+    )
 except ImportError:  # direct source import for hermetic tests
     from library_store import CATEGORIES, NONE_SELECTION, LibraryStore, ValidationError, create_default_store
-    from image_extractor import clean_positive_prompt, extract_prompt_from_metadata, parse_prompt_sections, query_vision_api
+    from image_extractor import (
+        clean_positive_prompt,
+        extract_prompt_from_metadata,
+        parse_prompt_sections,
+        parse_structured_vision_response,
+        query_vision_api,
+        structured_vision_to_sections,
+    )
 
 
 DEFAULT_COMPONENT_ORDER = "style, character, action, background, prompt"
 DEFAULT_SELECTION_STATE = '{"version":1,"selections":{}}'
 _DEFAULT_ORDER = ("style", "character", "action", "background", "prompt")
 _STORE: LibraryStore | None = None
+_LORA_CACHE: dict[str, tuple[int, int, Any, Any]] = {}
+_MAX_CACHED_LORAS = 8
+
+
+def _image_path_fingerprint(image_path: Any) -> str:
+    """Match ComfyUI's content-based image invalidation contract."""
+    if not isinstance(image_path, str) or not image_path.strip():
+        return "empty"
+    path = Path(image_path.strip())
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "unreadable"
+    return digest.digest().hex()
 
 
 def set_library_store(store: LibraryStore | None) -> None:
@@ -153,6 +189,98 @@ def _default_v2_order(store: LibraryStore) -> str:
     return json.dumps(ids + ["prompt"], ensure_ascii=False, separators=(",", ":"))
 
 
+def _selected_loras(selected_by_category: dict[str, list[dict[str, Any]]], order: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build one deterministic LoRA activation per filename from selected concepts."""
+
+    activations: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    by_name: dict[str, dict[str, Any]] = {}
+    for category_id in order:
+        if category_id == "prompt":
+            continue
+        for entry in selected_by_category.get(category_id, []):
+            source = {"category_id": category_id, "entry_id": entry["id"], "entry_name": entry["name"]}
+            for attachment in entry.get("loras", []):
+                key = attachment["name"].casefold()
+                current = by_name.get(key)
+                if current is None:
+                    current = {
+                        "name": attachment["name"],
+                        "strength_model": attachment["strength_model"],
+                        "strength_clip": attachment["strength_clip"],
+                        "sources": [source],
+                    }
+                    by_name[key] = current
+                    activations.append(current)
+                    continue
+                current["sources"].append(source)
+                if (current["strength_model"], current["strength_clip"]) != (attachment["strength_model"], attachment["strength_clip"]):
+                    conflicts.append({
+                        "name": attachment["name"],
+                        "kept": {"strength_model": current["strength_model"], "strength_clip": current["strength_clip"]},
+                        "ignored": {"strength_model": attachment["strength_model"], "strength_clip": attachment["strength_clip"]},
+                        "source": source,
+                    })
+    return activations, conflicts
+
+
+def _load_lora_state(name: str) -> tuple[Any, Any]:
+    try:
+        import folder_paths  # type: ignore
+        import comfy.utils  # type: ignore
+    except ImportError as exc:  # pragma: no cover - only reachable outside ComfyUI
+        raise RuntimeError("LoRA activation requires the ComfyUI runtime") from exc
+
+    resolver = getattr(folder_paths, "get_full_path_or_raise", None)
+    path = resolver("loras", name) if callable(resolver) else folder_paths.get_full_path("loras", name)
+    if not path:
+        raise RuntimeError(f"Attached LoRA is not installed: {name}")
+    stat = Path(path).stat()
+    key = str(Path(path).resolve())
+    cached = _LORA_CACHE.get(key)
+    if cached is not None and cached[:2] == (stat.st_mtime_ns, stat.st_size):
+        return cached[2], cached[3]
+    load_torch_file = comfy.utils.load_torch_file
+    if "return_metadata" in inspect.signature(load_torch_file).parameters:
+        state, metadata = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
+    else:  # compatibility with older supported ComfyUI builds
+        state = comfy.utils.load_torch_file(path, safe_load=True)
+        metadata = None
+    if len(_LORA_CACHE) >= _MAX_CACHED_LORAS:
+        _LORA_CACHE.pop(next(iter(_LORA_CACHE)))
+    _LORA_CACHE[key] = (stat.st_mtime_ns, stat.st_size, state, metadata)
+    return state, metadata
+
+
+def _apply_loras(model: Any, clip: Any, activations: list[dict[str, Any]]) -> tuple[Any, Any]:
+    if model is None and clip is None:
+        return model, clip
+    try:
+        import comfy.sd  # type: ignore
+    except ImportError as exc:  # pragma: no cover - only reachable outside ComfyUI
+        raise RuntimeError("LoRA activation requires the ComfyUI runtime") from exc
+    current_model, current_clip = model, clip
+    for activation in activations:
+        strength_model = activation["strength_model"] if current_model is not None else 0.0
+        strength_clip = activation["strength_clip"] if current_clip is not None else 0.0
+        if strength_model == 0.0 and strength_clip == 0.0:
+            continue
+        state, metadata = _load_lora_state(activation["name"])
+        load_for_models = comfy.sd.load_lora_for_models
+        if "lora_metadata" in inspect.signature(load_for_models).parameters:
+            current_model, current_clip = comfy.sd.load_lora_for_models(
+                current_model,
+                current_clip,
+                state,
+                strength_model,
+                strength_clip,
+                lora_metadata=metadata,
+            )
+        else:  # compatibility with older supported ComfyUI builds
+            current_model, current_clip = comfy.sd.load_lora_for_models(current_model, current_clip, state, strength_model, strength_clip)
+    return current_model, current_clip
+
+
 class MasterPromptLibraryV2:
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -162,11 +290,15 @@ class MasterPromptLibraryV2:
                 "prompt": ("STRING", {"multiline": True, "default": "", "dynamicPrompts": False}),
                 "selection_state": ("STRING", {"default": DEFAULT_SELECTION_STATE, "multiline": False}),
                 "component_order": ("STRING", {"default": _default_v2_order(store), "multiline": False}),
-            }
+            },
+            "optional": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+            },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("combined_prompt", "style_prompt", "character_prompt", "action_prompt", "background_prompt", "components_json")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "MODEL", "CLIP")
+    RETURN_NAMES = ("combined_prompt", "style_prompt", "character_prompt", "action_prompt", "background_prompt", "components_json", "loras_json", "model", "clip")
     FUNCTION = "assemble"
     CATEGORY = "Prompt Library"
     DESCRIPTION = "Select and deterministically assemble ordered prompt components from Master Prompt Library v2."
@@ -187,7 +319,7 @@ class MasterPromptLibraryV2:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
     @classmethod
-    def assemble(cls, prompt: str = "", selection_state: str = DEFAULT_SELECTION_STATE, component_order: str | None = None) -> tuple[str, str, str, str, str, str]:
+    def assemble(cls, prompt: str = "", selection_state: str = DEFAULT_SELECTION_STATE, component_order: str | None = None, model: Any = None, clip: Any = None) -> tuple[Any, ...]:
         store = get_library_store()
         library = store.get_library()
         if library.get("version") != 2:
@@ -213,7 +345,7 @@ class MasterPromptLibraryV2:
                         missing_entries.append(entry_id)
                     continue
                 entry = found[1]
-                selected.append({"id": entry["id"], "name": entry["name"], "prompt": entry["prompt"]})
+                selected.append({"id": entry["id"], "name": entry["name"], "prompt": entry["prompt"], "loras": entry.get("loras", [])})
             if selected:
                 selected_by_category[category_id] = selected
         values: dict[str, str] = {category_id: ", ".join(item["prompt"] for item in selected_by_category.get(category_id, [])) for category_id in category_order}
@@ -234,10 +366,17 @@ class MasterPromptLibraryV2:
             if section:
                 sections.append(section)
         combined = "\n\n".join(sections)
-        components = {"schema_version": 1, "component_order": order, "categories": categories_payload, "free_prompt": values["prompt"], "missing_category_ids": missing_categories, "missing_entry_ids": missing_entries}
+        loras, lora_conflicts = _selected_loras(selected_by_category, order)
+        model_connected = model is not None
+        clip_connected = clip is not None
+        applied = any((model_connected and item["strength_model"] != 0.0) or (clip_connected and item["strength_clip"] != 0.0) for item in loras)
+        model, clip = _apply_loras(model, clip, loras)
+        lora_report = {"schema_version": 1, "applied": applied, "loras": loras, "conflicts": lora_conflicts}
+        components = {"schema_version": 1, "component_order": order, "categories": categories_payload, "free_prompt": values["prompt"], "loras": loras, "lora_conflicts": lora_conflicts, "missing_category_ids": missing_categories, "missing_entry_ids": missing_entries}
         components_json = json.dumps(components, ensure_ascii=False, separators=(",", ":"))
+        loras_json = json.dumps(lora_report, ensure_ascii=False, separators=(",", ":"))
         core_outputs = tuple(values.get(category, "") for category in CATEGORIES)
-        return (combined, *core_outputs, components_json)
+        return (combined, *core_outputs, components_json, loras_json, model, clip)
 
     apply = assemble
 
@@ -332,6 +471,7 @@ class MasterPromptImageExtractor:
             "fingerprint": store.fingerprint(),
             "target_category": target_category,
             "image_path": image_path,
+            "image_content": _image_path_fingerprint(image_path),
             "caption_override": caption_override,
             "api_endpoint": api_endpoint,
             "api_model": api_model,
@@ -351,14 +491,13 @@ class MasterPromptImageExtractor:
         api_model: str = "",
         vision_prompt: str = "",
     ) -> tuple[str, str, str, str, str, str, str, Any]:
-        from pathlib import Path
-
         store = get_library_store()
         library = store.get_library()
         v2 = library.get("version") == 2
 
         extracted = ""
         source_mode = "none"
+        structured: dict[str, Any] | None = None
 
         # 1. Caption override takes highest precedence if non-empty
         if isinstance(caption_override, str) and caption_override.strip():
@@ -371,25 +510,33 @@ class MasterPromptImageExtractor:
             if p.exists() and p.is_file():
                 try:
                     file_bytes = p.read_bytes()
-                    meta_prompt = extract_prompt_from_metadata(file_bytes)
-                    if meta_prompt:
-                        extracted = meta_prompt
-                        source_mode = "metadata"
-                    elif api_endpoint and api_endpoint.strip():
-                        extracted = query_vision_api(file_bytes, api_endpoint, api_key, api_model, vision_prompt)
-                        source_mode = "vision"
-                except Exception:
-                    pass
+                except OSError as exc:
+                    raise RuntimeError(f"Unable to read image file '{p}'") from exc
+                meta_prompt = extract_prompt_from_metadata(file_bytes)
+                if meta_prompt:
+                    extracted = meta_prompt
+                    source_mode = "metadata"
+                elif api_endpoint and api_endpoint.strip():
+                    extracted = query_vision_api(file_bytes, api_endpoint, api_key, api_model, vision_prompt)
+                    source_mode = "vision"
+                    structured = parse_structured_vision_response(extracted)
+                    if structured is not None:
+                        extracted = structured["positive_prompt"]
+            elif image is None:
+                if p.exists():
+                    raise RuntimeError(f"Image path is not a file: '{p}'")
+                raise RuntimeError(f"Image file not found: '{p}'")
 
         # 3. If image tensor is provided and vision API is configured
         if not extracted and image is not None and api_endpoint and api_endpoint.strip():
             png_bytes = _tensor_to_png_bytes(image)
-            if png_bytes:
-                try:
-                    extracted = query_vision_api(png_bytes, api_endpoint, api_key, api_model, vision_prompt)
-                    source_mode = "vision"
-                except Exception:
-                    pass
+            if not png_bytes:
+                raise RuntimeError("Unable to convert the supplied image tensor for vision extraction")
+            extracted = query_vision_api(png_bytes, api_endpoint, api_key, api_model, vision_prompt)
+            source_mode = "vision"
+            structured = parse_structured_vision_response(extracted)
+            if structured is not None:
+                extracted = structured["positive_prompt"]
 
         # Parse sections
         category_names: list[str] = []
@@ -401,7 +548,11 @@ class MasterPromptImageExtractor:
         else:
             category_names = list(CATEGORIES)
 
-        sections = parse_prompt_sections(extracted, category_names) if extracted else {}
+        sections = (
+            structured_vision_to_sections(structured)
+            if structured is not None
+            else parse_prompt_sections(extracted, category_names) if extracted else {}
+        )
 
         def _get_sec(key: str) -> str:
             for k, v in sections.items():
@@ -409,10 +560,16 @@ class MasterPromptImageExtractor:
                     return v
             return ""
 
-        style_prompt = _get_sec("style")
-        character_prompt = _get_sec("character")
-        action_prompt = _get_sec("action")
-        background_prompt = _get_sec("background")
+        if structured is not None:
+            style_prompt = structured["style"]
+            character_prompt = structured["character"]
+            action_prompt = structured["action"]
+            background_prompt = structured["background"]
+        else:
+            style_prompt = _get_sec("style")
+            character_prompt = _get_sec("character")
+            action_prompt = _get_sec("action")
+            background_prompt = _get_sec("background")
 
         target_prompt = ""
         if target_category == "auto" or not target_category:
@@ -435,6 +592,9 @@ class MasterPromptImageExtractor:
             "source_mode": source_mode,
             "sections": sections,
         }
+        if structured is not None:
+            components["structured"] = structured
+            components["confidence"] = structured["confidence"]
         components_json = json.dumps(components, ensure_ascii=False, separators=(",", ":"))
 
         return (

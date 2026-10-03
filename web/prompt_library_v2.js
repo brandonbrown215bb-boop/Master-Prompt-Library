@@ -7,10 +7,15 @@ import {
   buildAssembledPrompt,
   categoryLabel,
   cleanPositivePrompt,
+  applyExtractionResponse,
   filterEntriesV2,
   folderOptions,
   galleryState,
   importPreviewSummary,
+  extractionRequestToken,
+  extractionCategoryForField,
+  extractionFieldOptions,
+  extractionSavePlan,
   moveByOffset,
   navigateCatalogIndex,
   normalizeComponentOrder,
@@ -25,11 +30,36 @@ import {
   serializeSelectionState,
   selectImportFiles,
   selectImportSource,
+  selectExtractionField,
+  selectedExtractionFields,
   setGalleryPrimary,
+  runIfCurrentExtractionRequest,
+  selectedExtractionDraft,
   staleSelectionIds,
   suggestEntryName,
-} from "./library_v2_logic.mjs";
-import { installQuickPicker } from "./prompt_library_quick_picker.mjs";
+  updateExtractionFieldDraft,
+  toggleExtractionFieldSelection,
+  visionExtractionRequestFields,
+} from "./library_v2_logic.mjs?v=2.1.0-lora1";
+import { installQuickPicker } from "./prompt_library_quick_picker.mjs?v=2.1.0-lora1";
+import {
+  clampLayoutGeometry,
+  layoutCSSVariables,
+  loadLayoutState,
+  nextTabIndex,
+  resetLayoutState,
+  saveLayoutState,
+  viewportSize,
+} from "./modal_ui_state.mjs?v=2.1.0-uiux1";
+import {
+  VISION_PROVIDERS,
+  connectionForProvider,
+  forgetVisionConnection,
+  loadVisionConnection,
+  normalizeVisionModels,
+  saveVisionConnection,
+  visionProvider,
+} from "./vision_connection_state.mjs?v=2.1.0-vision1";
 
 const EXTENSION_NAME = "PromptLibrary.MasterPromptLibraryV2";
 const API_BASE = "/master_prompt_library/v2";
@@ -133,7 +163,7 @@ function entryFromPayload(payload) {
 
 function ensureStyles() {
   for (const href of [
-    new URL("./prompt_library_v2.css", import.meta.url).href,
+    new URL("./prompt_library_v2.css?v=2.1.0-lora1", import.meta.url).href,
     new URL("./prompt_library_quick_picker.css", import.meta.url).href,
   ]) {
     if (document.querySelector(`link[data-mpl2-styles="${href}"]`)) continue;
@@ -236,7 +266,10 @@ class MasterPromptLibraryV2Modal {
     this.galleryKind = "preview";
     this.galleryBusy = false;
     this.galleryStatuses = new Map();
+    this.availableLoras = [];
+    this.lorasLoaded = false;
     this.importState = { preview: null, mapping: {}, policy: "skip", files: [], sources: [], sourceId: "" };
+    const visionConnection = loadVisionConnection();
     this.extractState = {
       file: null,
       previewUrl: "",
@@ -247,10 +280,16 @@ class MasterPromptLibraryV2Modal {
       tags: "",
       source: "",
       sections: {},
+      structured: null,
+      selectedExtractedField: "positive_prompt",
+      selectedExtractionFields: ["positive_prompt"],
+      extractedFieldDrafts: { positive_prompt: "" },
       busy: false,
-      apiEndpoint: "",
-      apiKey: "",
-      apiModel: "gpt-4o-mini",
+      ...visionConnection,
+      visionModels: normalizeVisionModels([], visionConnection.apiModel),
+      visionModelsLoading: false,
+      visionModelsError: "",
+      customModel: false,
     };
     this.busy = false;
     this.statusMessage = "";
@@ -259,8 +298,15 @@ class MasterPromptLibraryV2Modal {
     this.imageRevision = 0;
     this.activeSubdialog = null;
     this.closeActiveSubdialog = null;
+    this.subdialogSequence = 0;
+    this.focusRestore = null;
+    this.mobilePane = "catalog";
+    this.layout = loadLayoutState();
+    this.layoutObserver = null;
+    this.splitterDrag = null;
     this.showPromptPreview = false;
     this.build();
+    this.applyLayout();
     this.boundKeydown = (event) => this.handleKeydown(event);
   }
 
@@ -272,7 +318,7 @@ class MasterPromptLibraryV2Modal {
       element("p", { className: "mpl2-subtitle", textContent: "Select ordered components, keep the archive local, and apply one deterministic state to the node." }),
     ]);
     this.context = element("p", { className: "mpl2-context" });
-    this.closeButton = element("button", { className: "mpl2-close", type: "button", "aria-label": "Close library", title: "Close library", textContent: "×" });
+    this.closeButton = this.setFocusKey(element("button", { className: "mpl2-close", type: "button", "aria-label": "Close library", title: "Close library", textContent: "×" }), "close");
     this.closeButton.addEventListener("click", () => void this.close());
     header.append(heading, this.context, this.closeButton);
 
@@ -293,18 +339,36 @@ class MasterPromptLibraryV2Modal {
     favoriteLabel.append(this.favoriteInput, document.createTextNode(" Favorites"));
     this.clearFiltersButton = this.actionButton("Clear filters", "", () => { this.query = ""; this.folderId = ""; this.tag = ""; this.favoritesOnly = false; this.resetCatalogPage(); this.render(); });
     this.importButton = this.actionButton("Import…", "", () => { this.mode = "import"; this.clearError(); this.loadImportSources(); this.render(); });
-    this.extractButton = this.actionButton("Extract Image…", "", () => { this.mode = "extract_image"; this.clearError(); this.initExtractImageState(); this.render(); });
+    this.extractButton = this.actionButton("Extract Image…", "", () => {
+      this.mode = "extract_image";
+      this.clearError();
+      this.initExtractImageState();
+      this.render();
+      void this.refreshVisionModels({ silent: true });
+    });
     this.exportButton = this.actionButton("Export JSON", "", () => this.exportLibrary());
-    toolbar.append(searchWrap, this.folderSelect, this.tagSelect, favoriteLabel, this.clearFiltersButton, this.importButton, this.extractButton, this.exportButton);
+    this.layoutControls = element("div", { className: "mpl2-layout-controls", "aria-label": "Layout controls" });
+    this.resetLayoutButton = this.actionButton("Reset layout", "", () => this.resetLayout());
+    this.layoutControls.appendChild(this.resetLayoutButton);
+    toolbar.append(searchWrap, this.folderSelect, this.tagSelect, favoriteLabel, this.clearFiltersButton, this.importButton, this.extractButton, this.exportButton, this.layoutControls);
 
     this.error = element("div", { className: "mpl2-error", role: "alert", hidden: true });
     this.body = element("div", { className: "mpl2-body" });
     this.rail = element("aside", { className: "mpl2-rail", "aria-label": "Prompt categories" });
+    this.paneTabs = element("div", { className: "mpl2-pane-tabs", role: "tablist", "aria-label": "Prompt panes" });
     this.main = element("main", { className: "mpl2-main" });
-    this.listPane = element("section", { className: "mpl2-list-pane", "aria-label": "Prompt catalog" });
-    this.detailPane = element("section", { className: "mpl2-detail-pane", "aria-label": "Selection and entry details" });
-    this.main.append(this.listPane, this.detailPane);
-    this.body.append(this.rail, this.main);
+    this.listPane = element("section", { className: "mpl2-list-pane", id: "mpl2-catalog-pane", role: "tabpanel", "aria-labelledby": "mpl2-pane-tab-catalog", "aria-label": "Prompt catalog" });
+    this.detailPane = element("section", { className: "mpl2-detail-pane", id: "mpl2-detail-pane", role: "tabpanel", "aria-labelledby": "mpl2-pane-tab-detail", "aria-label": "Selection and entry details" });
+    this.mainSplitter = element("div", {
+      className: "mpl2-main-splitter",
+      role: "separator",
+      tabindex: "0",
+      "aria-orientation": "vertical",
+      "aria-label": "Resize catalog and details panes",
+    });
+    this.main.append(this.listPane, this.mainSplitter, this.detailPane);
+    this.body.append(this.rail, this.paneTabs, this.main);
+    this.installSplitterHandlers();
     this.footer = element("footer", { className: "mpl2-footer" });
     this.applyButton = this.actionButton("Apply to Node", "primary", () => this.applyToNode());
     this.footer.append(element("span", { className: "mpl2-footer-note", textContent: "Closing keeps the node's prior state." }), this.applyButton);
@@ -319,16 +383,236 @@ class MasterPromptLibraryV2Modal {
     });
   }
 
-  showSubdialog({ title, content, actions = [] }) {
+  currentViewport() {
+    let gutter = 8;
+    try {
+      const rootStyle = getComputedStyle(this.root);
+      // Padding is a resolved CSS length even when the custom property itself
+      // contains a clamp() expression.
+      const rawGutter = rootStyle.paddingLeft || rootStyle.getPropertyValue("--mpl2-modal-gutter");
+      const parsedGutter = Number.parseFloat(rawGutter);
+      if (Number.isFinite(parsedGutter)) gutter = parsedGutter;
+      return { ...viewportSize({ width: window.innerWidth, height: window.innerHeight }), gutter };
+    } catch {
+      return { ...viewportSize(), gutter };
+    }
+  }
+
+  applyLayout() {
+    this.layout = clampLayoutGeometry(this.layout, this.currentViewport());
+    const variables = layoutCSSVariables(this.layout, this.currentViewport());
+    // Native CSS resize writes direct width/height properties.  The persisted
+    // CSS variables are the single geometry source, so clear those overrides
+    // after capturing a resize (and on Reset) before reapplying the variables.
+    this.dialog.style.removeProperty("width");
+    this.dialog.style.removeProperty("height");
+    for (const [name, value] of Object.entries(variables)) this.dialog.style.setProperty(name, value);
+    this.main?.style.setProperty("--mpl2-list-width", variables["--mpl2-list-width"]);
+    if (this.mainSplitter) {
+      const maxList = Math.max(220, this.layout.dialogWidth - 320);
+      this.mainSplitter.setAttribute("aria-valuemin", "220");
+      this.mainSplitter.setAttribute("aria-valuemax", String(Math.round(maxList)));
+      this.mainSplitter.setAttribute("aria-valuenow", String(this.layout.listWidth));
+    }
+  }
+
+  persistLayout() {
+    saveLayoutState(this.layout, undefined, this.currentViewport());
+    this.applyLayout();
+  }
+
+  resetLayout() {
+    this.layout = resetLayoutState(undefined, this.currentViewport());
+    this.applyLayout();
+    this.setStatus("Layout reset to defaults.");
+    if (!this.root.hidden) this.render();
+  }
+
+  setListWidth(value, { persist = true } = {}) {
+    const next = clampLayoutGeometry({ ...this.layout, listWidth: value }, this.currentViewport());
+    this.layout = next;
+    this.applyLayout();
+    if (persist) saveLayoutState(this.layout, undefined, this.currentViewport());
+  }
+
+  installSplitterHandlers() {
+    this.mainSplitter.addEventListener("pointerdown", (event) => {
+      if (event.button !== undefined && event.button !== 0) return;
+      event.preventDefault();
+      this.splitterDrag = { startX: event.clientX, startListWidth: this.layout.listWidth, pointerId: event.pointerId };
+      this.mainSplitter.setPointerCapture?.(event.pointerId);
+    });
+    this.mainSplitter.addEventListener("pointermove", (event) => {
+      if (!this.splitterDrag) return;
+      event.preventDefault();
+      this.setListWidth(this.splitterDrag.startListWidth + (event.clientX - this.splitterDrag.startX));
+    });
+    const stopDrag = (event) => {
+      if (!this.splitterDrag) return;
+      if (event?.pointerId === undefined || event.pointerId === this.splitterDrag.pointerId) this.splitterDrag = null;
+    };
+    this.mainSplitter.addEventListener("pointerup", stopDrag);
+    this.mainSplitter.addEventListener("pointercancel", stopDrag);
+    this.mainSplitter.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const viewport = this.currentViewport();
+      const maxList = Math.max(220, this.layout.dialogWidth - 320);
+      const next = event.key === "Home"
+        ? 220
+        : event.key === "End"
+          ? maxList
+          : this.layout.listWidth + (event.key === "ArrowRight" ? 16 : -16);
+      this.setListWidth(next);
+    });
+    const ResizeObserverCtor = globalThis.ResizeObserver;
+    if (typeof ResizeObserverCtor === "function") {
+      this.layoutObserver = new ResizeObserverCtor(() => {
+        if (this.root.hidden) return;
+        const viewport = this.currentViewport();
+        const measured = this.dialog.getBoundingClientRect?.();
+        if (!measured?.width || !measured?.height) return;
+        const hasDirectWidth = Boolean(this.dialog.style.width);
+        const hasDirectHeight = Boolean(this.dialog.style.height);
+        if (!hasDirectWidth && !hasDirectHeight) {
+          const restored = loadLayoutState(undefined, viewport);
+          if (JSON.stringify(restored) !== JSON.stringify(this.layout)) {
+            this.layout = restored;
+            this.applyLayout();
+          }
+          return;
+        }
+        // A viewport cap is not a user resize.  Keep the larger preference so
+        // reopening on a larger monitor can restore it.
+        const raw = { ...this.layout };
+        const maxWidth = viewport.width - (2 * viewport.gutter);
+        const maxHeight = viewport.height - (2 * viewport.gutter);
+        const userResizedWidth = measured.width < maxWidth - 2;
+        const userResizedHeight = measured.height < maxHeight - 2;
+        // A window/monitor change can make the rendered box smaller without
+        // changing the user's preference. Keep the larger stored value so it
+        // can be restored when the viewport grows again.
+        if (!userResizedWidth && !userResizedHeight) {
+          this.applyLayout();
+          return;
+        }
+        if (userResizedWidth) raw.dialogWidth = measured.width;
+        if (userResizedHeight) raw.dialogHeight = measured.height;
+        const clamped = clampLayoutGeometry(raw, viewport);
+        if (Math.abs(clamped.dialogWidth - this.layout.dialogWidth) >= 2
+          || Math.abs(clamped.dialogHeight - this.layout.dialogHeight) >= 2
+          || Math.abs(clamped.listWidth - this.layout.listWidth) >= 2) {
+          this.layout = clamped;
+          this.applyLayout();
+          saveLayoutState(this.layout, undefined, viewport);
+        }
+      });
+      this.layoutObserver.observe(this.dialog);
+    }
+  }
+
+  setFocusKey(node, key) {
+    if (node && key) node.dataset.mpl2FocusKey = key;
+    return node;
+  }
+
+  focusByKey(key) {
+    if (!key) return null;
+    const target = [...this.dialog.querySelectorAll("[data-mpl2-focus-key]")]
+      .find((candidate) => candidate.dataset.mpl2FocusKey === key
+        && !candidate.disabled
+        && !candidate.hidden
+        && !candidate.closest("[hidden]"));
+    target?.focus?.();
+    return target || null;
+  }
+
+  captureRenderFocus() {
+    const active = document.activeElement;
+    if (!active || active === document.body || !this.dialog.contains(active)) return;
+    const key = active.dataset?.mpl2FocusKey;
+    if (key) this.focusRestore = { key };
+  }
+
+  restoreRenderFocus() {
+    const request = this.focusRestore;
+    this.focusRestore = null;
+    if (!request?.key) return;
+    const active = document.activeElement;
+    if (active && active !== document.body && this.dialog.contains(active) && active.isConnected !== false) return;
+    queueMicrotask(() => {
+      const current = document.activeElement;
+      if (current && current !== document.body && this.dialog.contains(current) && current.isConnected !== false) return;
+      if (this.focusByKey(request.key)) return;
+      const key = request.key;
+      const fallbackKeys = [];
+      if (key.startsWith("order-entry-remove:")) {
+        const [, categoryId, entryId] = key.split(":");
+        fallbackKeys.push(`order-entry-up:${categoryId}:${entryId}`, `order-entry-down:${categoryId}:${entryId}`);
+      }
+      if (key.startsWith("detail-delete:")) {
+        const [, entryId] = key.split(":");
+        fallbackKeys.push(`catalog-card:${entryId}`, "catalog-page:next", "catalog-page:previous");
+      }
+      fallbackKeys.push(`category:${this.activeCategory}`, `pane-tab:${this.mobilePane}`, "close");
+      for (const fallback of fallbackKeys) if (this.focusByKey(fallback)) return;
+    });
+  }
+
+  renderPaneTabs() {
+    this.body.dataset.mobilePane = this.mobilePane;
+    this.main.dataset.mobilePane = this.mobilePane;
+    clear(this.paneTabs);
+    const panes = [
+      { key: "catalog", label: "Catalog", controls: this.listPane.id },
+      { key: "detail", label: "Details", controls: this.detailPane.id },
+    ];
+    for (const pane of panes) {
+      const tab = this.setFocusKey(element("button", {
+        className: `mpl2-pane-tab${pane.key === this.mobilePane ? " is-active" : ""}`,
+        type: "button",
+        role: "tab",
+        id: `mpl2-pane-tab-${pane.key}`,
+        "aria-selected": String(pane.key === this.mobilePane),
+        "aria-controls": pane.controls,
+        tabindex: pane.key === this.mobilePane ? "0" : "-1",
+        textContent: pane.label,
+      }), `pane-tab:${pane.key}`);
+      tab.addEventListener("click", () => this.setMobilePane(pane.key));
+      this.paneTabs.appendChild(tab);
+    }
+  }
+
+  setMobilePane(pane, focus = true) {
+    if (pane !== "catalog" && pane !== "detail") return;
+    this.mobilePane = pane;
+    this.render();
+    if (focus) queueMicrotask(() => this.focusByKey(`pane-tab:${pane}`));
+  }
+
+  handlePaneTabKeydown(event) {
+    if (event.defaultPrevented) return false;
+    const target = event.target?.closest?.(".mpl2-pane-tab");
+    if (!target) return false;
+    const panes = ["catalog", "detail"];
+    const current = panes.indexOf(target.id.replace("mpl2-pane-tab-", ""));
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return false;
+    event.preventDefault();
+    const next = nextTabIndex(current, event.key, panes.length);
+    this.setMobilePane(panes[next]);
+    return true;
+  }
+
+  showSubdialog({ title, content, actions = [], onDismiss = null }) {
     if (this.activeSubdialog) {
-      this.activeSubdialog.remove();
-      this.activeSubdialog = null;
+      this.closeActiveSubdialog?.();
     }
     const previousFocus = document.activeElement;
     const backdrop = element("div", { className: "mpl2-subdialog-backdrop" });
-    const dialog = element("div", { className: "mpl2-subdialog", role: "dialog", "aria-modal": "true" });
+    const titleId = `mpl2-subdialog-title-${++this.subdialogSequence}`;
+    const dialog = element("div", { className: "mpl2-subdialog", role: "dialog", "aria-modal": "true", "aria-labelledby": titleId });
     const header = element("div", { className: "mpl2-subdialog-header" }, [
-      element("h4", { className: "mpl2-subdialog-title", textContent: title }),
+      element("h4", { className: "mpl2-subdialog-title", id: titleId, textContent: title }),
     ]);
     const body = element("div", { className: "mpl2-subdialog-body" });
     if (Array.isArray(content)) body.append(...content.filter(Boolean));
@@ -355,16 +639,21 @@ class MasterPromptLibraryV2Modal {
         previousFocus?.focus?.();
       }
     };
-    this.closeActiveSubdialog = close;
+    const dismiss = () => {
+      const wasActive = this.activeSubdialog === backdrop;
+      close();
+      if (wasActive) onDismiss?.();
+    };
+    this.closeActiveSubdialog = dismiss;
 
     backdrop.addEventListener("click", (e) => {
-      if (e.target === backdrop) close();
+      if (e.target === backdrop) dismiss();
     });
 
     const firstInput = dialog.querySelector("input, select, textarea, button.mpl2-button-primary, button");
     queueMicrotask(() => firstInput?.focus?.());
 
-    return { backdrop, dialog, close };
+    return { backdrop, dialog, close, dismiss };
   }
 
   promptDialog({ title, message, defaultValue = "", placeholder = "", confirmLabel = "Save" }) {
@@ -379,12 +668,13 @@ class MasterPromptLibraryV2Modal {
       input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           e.preventDefault();
+          e.stopPropagation();
           sub.close();
           resolve(input.value);
         } else if (e.key === "Escape") {
           e.preventDefault();
-          sub.close();
-          resolve(null);
+          e.stopPropagation();
+          sub.dismiss();
         }
       });
       sub = this.showSubdialog({
@@ -397,6 +687,7 @@ class MasterPromptLibraryV2Modal {
           { label: "Cancel", onClick: () => { sub.close(); resolve(null); } },
           { label: confirmLabel, primary: true, onClick: () => { sub.close(); resolve(input.value); } },
         ],
+        onDismiss: () => resolve(null),
       });
     });
   }
@@ -410,6 +701,7 @@ class MasterPromptLibraryV2Modal {
           { label: "Cancel", onClick: () => { sub.close(); resolve(false); } },
           { label: confirmLabel, variant, primary: variant === "primary", onClick: () => { sub.close(); resolve(true); } },
         ],
+        onDismiss: () => resolve(false),
       });
     });
   }
@@ -426,6 +718,7 @@ class MasterPromptLibraryV2Modal {
         actions: [
           { label: "Cancel", onClick: () => { sub.close(); resolve(null); } },
         ],
+        onDismiss: () => resolve(null),
       });
       for (const choice of choices) {
         const btn = element("button", {
@@ -459,6 +752,7 @@ class MasterPromptLibraryV2Modal {
             resolve(chosen);
           } },
         ],
+        onDismiss: () => resolve(null),
       });
     });
   }
@@ -478,6 +772,7 @@ class MasterPromptLibraryV2Modal {
             resolve(chosen);
           } },
         ],
+        onDismiss: () => resolve(null),
       });
     });
   }
@@ -486,6 +781,8 @@ class MasterPromptLibraryV2Modal {
     if (!isV2Node(node)) return;
     const newNode = this.activeNode !== node;
     this.activeNode = node;
+    this.layout = loadLayoutState(undefined, this.currentViewport());
+    this.applyLayout();
     this.previousFocus = document.activeElement;
     this.mode = "browse";
     this.errorMessage = "";
@@ -500,7 +797,7 @@ class MasterPromptLibraryV2Modal {
     this.root.hidden = false;
     document.addEventListener("keydown", this.boundKeydown);
     this.renderLoading();
-    this.refreshLibrary().then(() => {
+    Promise.all([this.refreshLibrary(), this.refreshLoras()]).then(() => {
       this.render();
       queueMicrotask(() => this.searchInput.focus());
     });
@@ -517,9 +814,9 @@ class MasterPromptLibraryV2Modal {
       if (!confirmed) return;
     }
     if (this.activeSubdialog) {
-      this.activeSubdialog.remove();
-      this.activeSubdialog = null;
+      this.closeActiveSubdialog?.();
     }
+    this.invalidateExtractRequests();
     this.root.hidden = true;
     document.removeEventListener("keydown", this.boundKeydown);
     this.previousFocus?.focus?.();
@@ -543,6 +840,7 @@ class MasterPromptLibraryV2Modal {
       }
       return;
     }
+    if (this.handlePaneTabKeydown(event)) return;
     if (event.key === "Escape") { event.preventDefault(); void this.close(); return; }
     if (this.handleCatalogKeydown(event)) return;
     if (event.key !== "Tab") return;
@@ -632,6 +930,21 @@ class MasterPromptLibraryV2Modal {
     }
   }
 
+  async refreshLoras() {
+    try {
+      const payload = await requestJSON(`${API_BASE}/loras`);
+      this.availableLoras = [...new Set((Array.isArray(payload?.loras) ? payload.loras : [])
+        .map((name) => text(name).trim()).filter(Boolean))].sort((left, right) => left.localeCompare(right));
+      this.lorasLoaded = true;
+      return this.availableLoras;
+    } catch {
+      // Manual names remain usable when ComfyUI cannot enumerate its LoRA folder.
+      this.availableLoras = [];
+      this.lorasLoaded = false;
+      return [];
+    }
+  }
+
   setError(error) {
     this.errorMessage = trimError(error);
     if (this.error) { this.error.hidden = false; this.error.textContent = this.errorMessage; }
@@ -702,7 +1015,8 @@ class MasterPromptLibraryV2Modal {
   }
 
   render() {
-    if (!this.library) { this.renderLoading(); return; }
+    this.captureRenderFocus();
+    if (!this.library) { this.renderLoading(); this.restoreRenderFocus(); return; }
     if (!this.categories().some((category) => category.id === this.activeCategory)) {
       this.activeCategory = this.categories()[0]?.id || "style";
       this.resetCatalogPage();
@@ -715,12 +1029,14 @@ class MasterPromptLibraryV2Modal {
     this.error.textContent = this.errorMessage;
     this.searchInput.value = this.query;
     this.favoriteInput.checked = this.favoritesOnly;
+    this.renderPaneTabs();
     this.renderRail();
     this.renderFilters();
     if (this.mode === "import") this.renderImportPane();
     else if (this.mode === "extract_image") this.renderExtractImagePane();
     else { this.renderCatalog(); this.renderDetail(); }
     this.renderFooter(stale);
+    this.restoreRenderFocus();
   }
 
   renderRail() {
@@ -734,17 +1050,17 @@ class MasterPromptLibraryV2Modal {
       item.addEventListener("dragstart", (event) => { event.dataTransfer.setData("text/mpl2-category", category.id); });
       item.addEventListener("dragover", (event) => event.preventDefault());
       item.addEventListener("drop", (event) => { event.preventDefault(); const from = this.categories().findIndex((candidate) => candidate.id === event.dataTransfer.getData("text/mpl2-category")); this.reorderCategories(from, index); });
-      const browse = element("button", { className: "mpl2-category", type: "button", "aria-current": category.id === this.activeCategory ? "page" : "false" }, [
+      const browse = this.setFocusKey(element("button", { className: "mpl2-category", type: "button", "aria-current": category.id === this.activeCategory ? "page" : "false" }, [
         element("span", { className: "mpl2-drag-handle", textContent: "⋮⋮", "aria-hidden": "true" }),
         element("span", { className: "mpl2-category-name", textContent: categoryLabel(category) }),
         element("span", { className: "mpl2-category-count", textContent: String(category.entries.length) }),
-      ]);
+      ]), `category:${category.id}`);
       browse.addEventListener("click", () => this.selectCategory(category.id));
-      const menu = element("button", { className: "mpl2-icon-button", type: "button", title: `Manage ${categoryLabel(category)}`, "aria-label": `Manage ${categoryLabel(category)}`, textContent: "⋯" });
+      const menu = this.setFocusKey(element("button", { className: "mpl2-icon-button", type: "button", title: `Manage ${categoryLabel(category)}`, "aria-label": `Manage ${categoryLabel(category)}`, textContent: "⋯" }), `category-menu:${category.id}`);
       menu.addEventListener("click", (event) => { event.stopPropagation(); this.categoryMenu(category); });
-      const moveUp = element("button", { className: "mpl2-icon-button", type: "button", title: `Move ${categoryLabel(category)} up`, "aria-label": `Move ${categoryLabel(category)} up`, textContent: "↑", disabled: index === 0 });
+      const moveUp = this.setFocusKey(element("button", { className: "mpl2-icon-button", type: "button", title: `Move ${categoryLabel(category)} up`, "aria-label": `Move ${categoryLabel(category)} up`, textContent: "↑", disabled: index === 0 }), `category-up:${category.id}`);
       moveUp.addEventListener("click", (event) => { event.stopPropagation(); this.reorderCategories(index, index - 1); });
-      const moveDown = element("button", { className: "mpl2-icon-button", type: "button", title: `Move ${categoryLabel(category)} down`, "aria-label": `Move ${categoryLabel(category)} down`, textContent: "↓", disabled: index === this.categories().length - 1 });
+      const moveDown = this.setFocusKey(element("button", { className: "mpl2-icon-button", type: "button", title: `Move ${categoryLabel(category)} down`, "aria-label": `Move ${categoryLabel(category)} down`, textContent: "↓", disabled: index === this.categories().length - 1 }), `category-down:${category.id}`);
       moveDown.addEventListener("click", (event) => { event.stopPropagation(); this.reorderCategories(index, index + 1); });
       item.append(browse, moveUp, moveDown, menu);
       this.rail.appendChild(item);
@@ -779,9 +1095,9 @@ class MasterPromptLibraryV2Modal {
       element("span", { textContent: `${pagination.total} / ${this.activeEntries().length}` }),
       this.actionButton("＋ Add entry", "primary", () => this.startAdd()),
     ]);
-    const previous = this.actionButton("Previous", "", () => this.goToCatalogPage(pagination.page - 1));
+    const previous = this.setFocusKey(this.actionButton("Previous", "", () => this.goToCatalogPage(pagination.page - 1)), "catalog-page:previous");
     previous.disabled = pagination.page <= 0;
-    const next = this.actionButton("Next", "", () => this.goToCatalogPage(pagination.page + 1));
+    const next = this.setFocusKey(this.actionButton("Next", "", () => this.goToCatalogPage(pagination.page + 1)), "catalog-page:next");
     next.disabled = pagination.page >= pagination.pageCount - 1;
     const status = element("span", {
       className: "mpl2-page-status",
@@ -798,7 +1114,12 @@ class MasterPromptLibraryV2Modal {
     this.listPane.append(heading, pager, list);
     const focusId = this.pendingCatalogFocusId;
     this.pendingCatalogFocusId = null;
-    if (focusId) queueMicrotask(() => this.focusCatalogEntry(focusId));
+    if (focusId) {
+      // Explicit catalog navigation has a more useful target than restoring
+      // the button that caused the page render.
+      this.focusRestore = null;
+      queueMicrotask(() => this.focusCatalogEntry(focusId));
+    }
   }
 
   imageUrl(entry, image) {
@@ -816,17 +1137,17 @@ class MasterPromptLibraryV2Modal {
   }
 
   entryCard(entry) {
-    const card = element("article", {
+    const card = this.setFocusKey(element("article", {
       className: `mpl2-entry-card${entry.id === this.cursorEntryId ? " is-focused" : ""}`,
       tabindex: entry.id === this.cursorEntryId ? "0" : "-1",
       role: "listitem",
       "aria-current": entry.id === this.selectedId ? "true" : "false",
       dataset: { entryId: entry.id },
-    });
-    const check = element("input", { type: "checkbox", checked: this.isSelected(entry.id), "aria-label": `Select ${entry.name}` });
+    }), `catalog-card:${entry.id}`);
+    const check = this.setFocusKey(element("input", { type: "checkbox", checked: this.isSelected(entry.id), "aria-label": `Select ${entry.name}` }), `catalog-checkbox:${entry.id}`);
     check.addEventListener("click", (event) => event.stopPropagation());
     check.addEventListener("change", () => { this.cursorEntryId = entry.id; this.toggleSelection(entry.id, check.checked); });
-    const favorite = element("button", { className: `mpl2-favorite${entry.favorite ? " is-favorite" : ""}`, type: "button", title: entry.favorite ? "Favorite" : "Add favorite", "aria-label": entry.favorite ? `Remove ${entry.name} from favorites` : `Add ${entry.name} to favorites`, textContent: entry.favorite ? "★" : "☆" });
+    const favorite = this.setFocusKey(element("button", { className: `mpl2-favorite${entry.favorite ? " is-favorite" : ""}`, type: "button", title: entry.favorite ? "Favorite" : "Add favorite", "aria-label": entry.favorite ? `Remove ${entry.name} from favorites` : `Add ${entry.name} to favorites`, textContent: entry.favorite ? "★" : "☆" }), `catalog-favorite:${entry.id}`);
     favorite.addEventListener("click", (event) => { event.stopPropagation(); this.updateEntryFavorite(entry, !entry.favorite); });
     const visual = this.imageOrPlaceholder(entry, this.primaryImage(entry));
     const copy = element("div", { className: "mpl2-entry-copy" }, [
@@ -899,9 +1220,9 @@ class MasterPromptLibraryV2Modal {
     group.addEventListener("drop", (event) => { event.preventDefault(); const fromToken = event.dataTransfer.getData("text/mpl2-tray-group"); const from = this.order.indexOf(fromToken); const to = this.order.indexOf(token); if (from >= 0 && to >= 0) { this.order = reorderIds(this.order, from, to); this.render(); } });
     const groupIndex = this.order.indexOf(token);
     const heading = element("div", { className: "mpl2-tray-group-heading" }, [element("span", { className: "mpl2-drag-handle", textContent: "⋮⋮", "aria-hidden": "true" }), element("strong", { textContent: label }), element("span", { className: "mpl2-tray-count", textContent: isPrompt ? "freeform" : String(entries.length) })]);
-    const groupUp = element("button", { className: "mpl2-order-button", type: "button", title: `Move ${label} earlier`, "aria-label": `Move ${label} earlier`, textContent: "↑", disabled: groupIndex <= 0 });
+    const groupUp = this.setFocusKey(element("button", { className: "mpl2-order-button", type: "button", title: `Move ${label} earlier`, "aria-label": `Move ${label} earlier`, textContent: "↑", disabled: groupIndex <= 0 }), `order-group-up:${token}`);
     groupUp.addEventListener("click", (event) => { event.stopPropagation(); this.moveGroup(token, -1); });
-    const groupDown = element("button", { className: "mpl2-order-button", type: "button", title: `Move ${label} later`, "aria-label": `Move ${label} later`, textContent: "↓", disabled: groupIndex < 0 || groupIndex >= this.order.length - 1 });
+    const groupDown = this.setFocusKey(element("button", { className: "mpl2-order-button", type: "button", title: `Move ${label} later`, "aria-label": `Move ${label} later`, textContent: "↓", disabled: groupIndex < 0 || groupIndex >= this.order.length - 1 }), `order-group-down:${token}`);
     groupDown.addEventListener("click", (event) => { event.stopPropagation(); this.moveGroup(token, 1); });
     heading.append(groupUp, groupDown);
     group.appendChild(heading);
@@ -913,11 +1234,11 @@ class MasterPromptLibraryV2Modal {
         chip.addEventListener("dragover", (event) => event.preventDefault());
         chip.addEventListener("drop", (event) => { event.preventDefault(); const data = JSON.parse(event.dataTransfer.getData("text/mpl2-tray-entry") || "{}"); if (data.categoryId !== token) return; const ids = this.selectedIds(token); const from = ids.indexOf(data.entryId); const to = ids.indexOf(entry.id); if (from >= 0 && to >= 0) { this.selection.selections[token] = reorderIds(ids, from, to); this.render(); } });
         const entryIndex = this.selectedIds(token).indexOf(entry.id);
-        const entryUp = element("button", { className: "mpl2-order-button", type: "button", title: `Move ${entry.name} earlier`, "aria-label": `Move ${entry.name} earlier`, textContent: "↑", disabled: entryIndex <= 0 });
+        const entryUp = this.setFocusKey(element("button", { className: "mpl2-order-button", type: "button", title: `Move ${entry.name} earlier`, "aria-label": `Move ${entry.name} earlier`, textContent: "↑", disabled: entryIndex <= 0 }), `order-entry-up:${token}:${entry.id}`);
         entryUp.addEventListener("click", (event) => { event.stopPropagation(); this.moveEntry(token, entry.id, -1); });
-        const entryDown = element("button", { className: "mpl2-order-button", type: "button", title: `Move ${entry.name} later`, "aria-label": `Move ${entry.name} later`, textContent: "↓", disabled: entryIndex < 0 || entryIndex >= this.selectedIds(token).length - 1 });
+        const entryDown = this.setFocusKey(element("button", { className: "mpl2-order-button", type: "button", title: `Move ${entry.name} later`, "aria-label": `Move ${entry.name} later`, textContent: "↓", disabled: entryIndex < 0 || entryIndex >= this.selectedIds(token).length - 1 }), `order-entry-down:${token}:${entry.id}`);
         entryDown.addEventListener("click", (event) => { event.stopPropagation(); this.moveEntry(token, entry.id, 1); });
-        const remove = element("button", { className: "mpl2-chip-remove", type: "button", "aria-label": `Remove ${entry.name}`, textContent: "×" });
+        const remove = this.setFocusKey(element("button", { className: "mpl2-chip-remove", type: "button", "aria-label": `Remove ${entry.name}`, textContent: "×" }), `order-entry-remove:${token}:${entry.id}`);
         chip.append(entryUp, entryDown);
         remove.addEventListener("click", (event) => { event.stopPropagation(); this.selection.selections[token] = this.selectedIds(token).filter((id) => id !== entry.id); this.render(); });
         chip.appendChild(remove);
@@ -932,45 +1253,89 @@ class MasterPromptLibraryV2Modal {
   renderEntryDetail(container, entry) {
     const heading = element("div", { className: "mpl2-detail-heading" }, [
       element("div", {}, [element("h3", { className: "mpl2-detail-title", textContent: entry.name }), element("p", { className: "mpl2-detail-meta", textContent: `${categoryLabel(this.activeCategoryObject())}${entry.folder_id ? " · filed" : " · unfiled"}` })]),
-      this.actionButton(entry.favorite ? "★ Favorite" : "☆ Favorite", entry.favorite ? "primary" : "", () => this.updateEntryFavorite(entry, !entry.favorite)),
+      this.setFocusKey(this.actionButton(entry.favorite ? "★ Favorite" : "☆ Favorite", entry.favorite ? "primary" : "", () => this.updateEntryFavorite(entry, !entry.favorite)), `detail-favorite:${entry.id}`),
     ]);
     const prompt = element("p", { className: "mpl2-prompt", textContent: entry.prompt });
     const tags = element("div", { className: "mpl2-tag-row" }, entry.tags.map((tag) => element("span", { className: "mpl2-tag", textContent: `#${tag}` })));
+    const loras = element("div", { className: "mpl2-lora-summary", "aria-label": "Attached LoRAs" }, (entry.loras || []).map((lora) => element("span", {
+      className: "mpl2-lora-chip",
+      textContent: `${lora.name} · M ${lora.strength_model} / C ${lora.strength_clip}`,
+      title: `${lora.name} · model ${lora.strength_model} · CLIP ${lora.strength_clip}`,
+    })));
     const actions = element("div", { className: "mpl2-detail-actions" }, [
-      this.actionButton(this.isSelected(entry.id) ? "Selected" : "Select", this.isSelected(entry.id) ? "primary" : "", () => this.toggleSelection(entry.id, !this.isSelected(entry.id))),
-      this.actionButton("Edit", "", () => this.startEdit(entry)),
-      this.actionButton("Duplicate", "", () => this.startDuplicate(entry)),
-      this.actionButton("Delete", "danger", () => this.deleteEntry(entry)),
+      this.setFocusKey(this.actionButton(this.isSelected(entry.id) ? "Selected" : "Select", this.isSelected(entry.id) ? "primary" : "", () => this.toggleSelection(entry.id, !this.isSelected(entry.id))), `detail-select:${entry.id}`),
+      this.setFocusKey(this.actionButton("Edit", "", () => this.startEdit(entry)), `detail-edit:${entry.id}`),
+      this.setFocusKey(this.actionButton("Duplicate", "", () => this.startDuplicate(entry)), `detail-duplicate:${entry.id}`),
+      this.setFocusKey(this.actionButton("Delete", "danger", () => this.deleteEntry(entry)), `detail-delete:${entry.id}`),
     ]);
-    container.append(heading, tags, prompt, actions, this.renderGallery(entry));
+    container.append(heading, tags, loras, prompt, actions, this.renderGallery(entry));
   }
 
   renderGallery(entry) {
     const section = element("section", { className: "mpl2-gallery", "aria-label": "Entry image gallery" });
     const tabs = element("div", { className: "mpl2-gallery-tabs", role: "tablist" });
+    const safeEntryId = String(entry.id || "entry").replace(/[^A-Za-z0-9_-]/g, "-");
     for (const kind of ["preview", "generated"]) {
-      const tab = element("button", { className: `mpl2-tab${this.galleryKind === kind ? " is-active" : ""}`, type: "button", role: "tab", "aria-selected": String(this.galleryKind === kind), textContent: kind === "preview" ? "Previews" : "Generated" });
+      const tabId = `mpl2-gallery-tab-${safeEntryId}-${kind}`;
+      const panelId = `mpl2-gallery-panel-${safeEntryId}-${kind}`;
+      const tab = this.setFocusKey(element("button", {
+        className: `mpl2-tab${this.galleryKind === kind ? " is-active" : ""}`,
+        type: "button",
+        role: "tab",
+        id: tabId,
+        "aria-controls": panelId,
+        "aria-selected": String(this.galleryKind === kind),
+        tabindex: this.galleryKind === kind ? "0" : "-1",
+        textContent: kind === "preview" ? "Previews" : "Generated",
+      }), `gallery-tab:${kind}`);
       tab.addEventListener("click", () => { this.galleryKind = kind; this.render(); });
+      tab.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const kinds = ["preview", "generated"];
+        const next = nextTabIndex(kinds.indexOf(kind), event.key, kinds.length);
+        this.galleryKind = kinds[next];
+        this.render();
+        queueMicrotask(() => this.focusByKey(`gallery-tab:${this.galleryKind}`));
+      });
       tabs.appendChild(tab);
     }
-    const fileInput = element("input", { className: "mpl2-hidden-file", type: "file", multiple: true, accept: "image/jpeg,image/png,image/webp", "aria-label": `Attach ${this.galleryKind} images` });
-    const fileLabel = element("label", { className: "mpl2-button" }, [fileInput, document.createTextNode(`＋ Add ${this.galleryKind === "preview" ? "previews" : "generated images"}`)]);
-    fileInput.addEventListener("change", (event) => this.uploadImages(entry, event.target.files, this.galleryKind));
-    const state = galleryState(entry, this.galleryKind);
-    const grid = element("div", { className: "mpl2-gallery-grid" });
-    if (!state.images.length) grid.appendChild(element("p", { className: "mpl2-gallery-empty", textContent: `No ${this.galleryKind} images attached.` }));
-    for (const [index, image] of state.images.entries()) grid.appendChild(this.galleryCard(entry, image, index, state.images));
-    const statuses = [...this.galleryStatuses.entries()].filter(([key]) => key.startsWith(`${this.galleryKind}:`));
-    const statusList = element("div", { className: "mpl2-upload-statuses", "aria-live": "polite" }, statuses.map(([, status]) => element("p", { className: `mpl2-image-status ${status.kind === "error" ? "is-error" : ""}`, textContent: status.message })));
-    section.append(tabs, element("div", { className: "mpl2-gallery-actions" }, [fileLabel, element("span", { className: "mpl2-image-note", textContent: "JPEG, PNG, or WebP · 8 MiB each · up to 20 total" })]), statusList, grid);
+    section.append(tabs);
+    for (const kind of ["preview", "generated"]) {
+      section.append(this.renderGalleryPanel(entry, kind, safeEntryId));
+    }
     return section;
   }
 
-  galleryCard(entry, image, index, images) {
+  renderGalleryPanel(entry, kind, safeEntryId = String(entry.id || "entry").replace(/[^A-Za-z0-9_-]/g, "-")) {
+    const panelId = `mpl2-gallery-panel-${safeEntryId}-${kind}`;
+    const tabId = `mpl2-gallery-tab-${safeEntryId}-${kind}`;
+    const panel = element("div", {
+      className: "mpl2-gallery-panel",
+      id: panelId,
+      role: "tabpanel",
+      "aria-labelledby": tabId,
+      tabindex: "0",
+      hidden: this.galleryKind !== kind,
+    });
+    const fileInput = element("input", { className: "mpl2-hidden-file", type: "file", multiple: true, accept: "image/jpeg,image/png,image/webp", "aria-label": `Attach ${kind} images` });
+    const fileLabel = element("label", { className: "mpl2-button" }, [fileInput, document.createTextNode(`＋ Add ${kind === "preview" ? "previews" : "generated images"}`)]);
+    fileInput.addEventListener("change", (event) => this.uploadImages(entry, event.target.files, kind));
+    const state = galleryState(entry, kind);
+    const grid = element("div", { className: "mpl2-gallery-grid" });
+    if (!state.images.length) grid.appendChild(element("p", { className: "mpl2-gallery-empty", textContent: `No ${kind} images attached.` }));
+    for (const [index, image] of state.images.entries()) grid.appendChild(this.galleryCard(entry, image, index, state.images, kind));
+    const statuses = [...this.galleryStatuses.entries()].filter(([key]) => key.startsWith(`${kind}:`));
+    const statusList = element("div", { className: "mpl2-upload-statuses", "aria-live": "polite" }, statuses.map(([, status]) => element("p", { className: `mpl2-image-status ${status.kind === "error" ? "is-error" : ""}`, textContent: status.message })));
+    panel.append(element("div", { className: "mpl2-gallery-actions" }, [fileLabel, element("span", { className: "mpl2-image-note", textContent: "JPEG, PNG, or WebP · 8 MiB each · up to 20 total" })]), statusList, grid);
+    return panel;
+  }
+
+  galleryCard(entry, image, index, images, kind = this.galleryKind) {
     const card = element("article", { className: "mpl2-gallery-card", draggable: true });
     card.addEventListener("dragstart", (event) => { event.dataTransfer.setData("text/mpl2-gallery-index", String(index)); });
     card.addEventListener("dragover", (event) => event.preventDefault());
-    card.addEventListener("drop", (event) => { event.preventDefault(); const from = Number(event.dataTransfer.getData("text/mpl2-gallery-index")); if (Number.isInteger(from)) this.reorderImages(entry, images, from, index); });
+    card.addEventListener("drop", (event) => { event.preventDefault(); const from = Number(event.dataTransfer.getData("text/mpl2-gallery-index")); if (Number.isInteger(from)) this.reorderImages(entry, images, from, index, kind); });
     card.appendChild(element("img", { className: "mpl2-gallery-image", src: this.imageUrl(entry, image), alt: image.caption || `${image.kind} image ${index + 1}` }));
     const captionWrap = element("div", { style: "display: flex; align-items: center; gap: 4px;" });
     const caption = element("input", { className: "mpl2-input", type: "text", maxlength: "240", value: image.caption || "", placeholder: "Caption", "aria-label": `Caption for image ${index + 1}` });
@@ -982,19 +1347,64 @@ class MasterPromptLibraryV2Modal {
     });
     captionWrap.append(caption, savedTick);
     const controls = element("div", { className: "mpl2-gallery-card-actions" }, [
-      this.actionButton("↑", "", () => this.reorderImages(entry, images, index, Math.max(0, index - 1))),
-      this.actionButton("↓", "", () => this.reorderImages(entry, images, index, Math.min(images.length - 1, index + 1))),
-      this.actionButton("Delete", "danger", () => void this.deleteImage(entry, image)),
+      this.setFocusKey(this.actionButton("↑", "", () => this.reorderImages(entry, images, index, Math.max(0, index - 1), kind)), `gallery-up:${kind}:${image.id}`),
+      this.setFocusKey(this.actionButton("↓", "", () => this.reorderImages(entry, images, index, Math.min(images.length - 1, index + 1), kind)), `gallery-down:${kind}:${image.id}`),
+      this.setFocusKey(this.actionButton("Delete", "danger", () => void this.deleteImage(entry, image)), `gallery-delete:${kind}:${image.id}`),
     ]);
-    if (image.kind === "preview") controls.insertBefore(this.actionButton(entry.primary_image_id === image.id ? "Primary" : "Set primary", entry.primary_image_id === image.id ? "primary" : "", () => this.setPrimary(entry, image)), controls.firstChild);
+    if (image.kind === "preview") controls.insertBefore(this.setFocusKey(this.actionButton(entry.primary_image_id === image.id ? "Primary" : "Set primary", entry.primary_image_id === image.id ? "primary" : "", () => this.setPrimary(entry, image)), `gallery-primary:${image.id}`), controls.firstChild);
     const status = this.galleryStatuses.get(image.id);
     card.append(captionWrap, controls);
     if (status) card.appendChild(element("p", { className: `mpl2-image-status ${status.kind === "error" ? "is-error" : ""}`, textContent: status.message }));
     return card;
   }
 
+  renderLoraEditor(draft) {
+    if (!Array.isArray(draft.loras)) draft.loras = [];
+    const section = element("fieldset", { className: "mpl2-lora-editor" });
+    section.appendChild(element("legend", { textContent: "LoRAs activated by this concept" }));
+    const datalistId = "mpl2-installed-loras";
+    const datalist = element("datalist", { id: datalistId }, this.availableLoras.map((name) => element("option", { value: name })));
+    section.appendChild(datalist);
+    const rows = element("div", { className: "mpl2-lora-rows" });
+    for (const [index, lora] of draft.loras.entries()) {
+      const name = element("input", {
+        className: "mpl2-input",
+        type: "text",
+        list: datalistId,
+        value: lora.name || "",
+        maxlength: "512",
+        placeholder: "LoRA filename or subfolder/path.safetensors",
+        "aria-label": `LoRA ${index + 1} filename`,
+      });
+      const modelStrength = element("input", { className: "mpl2-input", type: "number", min: "-100", max: "100", step: "0.05", value: lora.strength_model ?? 1, "aria-label": `LoRA ${index + 1} model strength` });
+      const clipStrength = element("input", { className: "mpl2-input", type: "number", min: "-100", max: "100", step: "0.05", value: lora.strength_clip ?? 1, "aria-label": `LoRA ${index + 1} CLIP strength` });
+      name.addEventListener("input", () => { lora.name = name.value; });
+      modelStrength.addEventListener("input", () => { lora.strength_model = modelStrength.value; });
+      clipStrength.addEventListener("input", () => { lora.strength_clip = clipStrength.value; });
+      const remove = this.actionButton("Remove", "danger", () => { draft.loras.splice(index, 1); this.render(); });
+      rows.appendChild(element("div", { className: "mpl2-lora-row" }, [
+        element("label", { className: "mpl2-lora-name" }, [element("span", { textContent: "LoRA" }), name]),
+        element("label", {}, [element("span", { textContent: "Model" }), modelStrength]),
+        element("label", {}, [element("span", { textContent: "CLIP" }), clipStrength]),
+        remove,
+      ]));
+    }
+    if (!draft.loras.length) rows.appendChild(element("p", { className: "mpl2-tray-note", textContent: "No LoRA attached. This concept only contributes prompt text." }));
+    const add = this.actionButton("＋ Attach LoRA", "", () => {
+      if (draft.loras.length >= 16) return;
+      draft.loras.push({ name: "", strength_model: 1, strength_clip: 1 });
+      this.render();
+    });
+    add.disabled = draft.loras.length >= 16;
+    section.append(rows, element("div", { className: "mpl2-lora-footer" }, [
+      add,
+      element("span", { className: "mpl2-tray-note", textContent: this.lorasLoaded ? `${this.availableLoras.length} installed LoRA${this.availableLoras.length === 1 ? "" : "s"} available.` : "Installed LoRAs could not be listed; a manual relative name still works." }),
+    ]));
+    return section;
+  }
+
   renderEditor(container) {
-    const draft = this.editorDraft || { name: "", prompt: "", tags: "", folder_id: "", favorite: false };
+    const draft = this.editorDraft || { name: "", prompt: "", tags: "", loras: [], folder_id: "", favorite: false };
     const category = this.activeCategoryObject();
     const form = element("div", { className: "mpl2-editor" });
     const name = element("input", { className: "mpl2-input", type: "text", maxlength: "120", value: draft.name, "aria-label": "Entry name" });
@@ -1012,7 +1422,7 @@ class MasterPromptLibraryV2Modal {
     tags.addEventListener("input", () => { draft.tags = tags.value; });
     folder.addEventListener("change", () => { draft.folder_id = folder.value; });
     favorite.addEventListener("change", () => { draft.favorite = favorite.checked; });
-    form.append(element("label", { className: "mpl2-field-label", textContent: "Name" }), name, element("label", { className: "mpl2-field-label", textContent: "Prompt text" }), prompt, element("label", { className: "mpl2-field-label", textContent: "Tags · comma separated" }), tags, element("label", { className: "mpl2-field-label", textContent: "Folder" }), element("div", { className: "mpl2-inline-field" }, [folder, newFolder]), element("label", { className: "mpl2-check-label" }, [favorite, document.createTextNode(" Favorite")]), element("div", { className: "mpl2-editor-actions" }, [this.actionButton("Save entry", "primary", () => this.saveEditor()), this.actionButton("Cancel", "", () => this.cancelEditor())]));
+    form.append(element("label", { className: "mpl2-field-label", textContent: "Name" }), name, element("label", { className: "mpl2-field-label", textContent: "Prompt text" }), prompt, element("label", { className: "mpl2-field-label", textContent: "Tags · comma separated" }), tags, this.renderLoraEditor(draft), element("label", { className: "mpl2-field-label", textContent: "Folder" }), element("div", { className: "mpl2-inline-field" }, [folder, newFolder]), element("label", { className: "mpl2-check-label" }, [favorite, document.createTextNode(" Favorite")]), element("div", { className: "mpl2-editor-actions" }, [this.actionButton("Save entry", "primary", () => this.saveEditor()), this.actionButton("Cancel", "", () => this.cancelEditor())]));
     container.append(element("div", { className: "mpl2-detail-heading" }, [element("h3", { className: "mpl2-detail-title", textContent: this.editorOriginal ? "Edit entry" : "New entry" })]), form);
     queueMicrotask(() => name.focus());
   }
@@ -1076,8 +1486,8 @@ class MasterPromptLibraryV2Modal {
   }
 
   startEdit(entry) {
-    this.editorOriginal = { id: entry.id, name: entry.name, prompt: entry.prompt, tags: entry.tags.join(", "), folder_id: entry.folder_id || "", favorite: entry.favorite };
-    this.editorDraft = { ...this.editorOriginal };
+    this.editorOriginal = { id: entry.id, name: entry.name, prompt: entry.prompt, tags: entry.tags.join(", "), loras: (entry.loras || []).map((lora) => ({ ...lora })), folder_id: entry.folder_id || "", favorite: entry.favorite };
+    this.editorDraft = { ...this.editorOriginal, loras: this.editorOriginal.loras.map((lora) => ({ ...lora })) };
     this.mode = "edit";
     this.clearError();
     this.render();
@@ -1089,14 +1499,14 @@ class MasterPromptLibraryV2Modal {
     let suffix = 2;
     while (names.has(name.toLocaleLowerCase())) name = `Copy of ${entry.name} (${suffix++})`;
     this.editorOriginal = null;
-    this.editorDraft = { name, prompt: entry.prompt, tags: entry.tags.join(", "), folder_id: entry.folder_id || "", favorite: false };
+    this.editorDraft = { name, prompt: entry.prompt, tags: entry.tags.join(", "), loras: (entry.loras || []).map((lora) => ({ ...lora })), folder_id: entry.folder_id || "", favorite: false };
     this.mode = "edit";
     this.render();
   }
 
   startAdd() {
     this.editorOriginal = null;
-    this.editorDraft = { name: "", prompt: "", tags: "", folder_id: "", favorite: false };
+    this.editorDraft = { name: "", prompt: "", tags: "", loras: [], folder_id: "", favorite: false };
     this.mode = "edit";
     this.render();
   }
@@ -1125,9 +1535,17 @@ class MasterPromptLibraryV2Modal {
     if (!name || !prompt) { this.setError("Name and prompt text are required."); return; }
     if (name.length > 120 || prompt.length > 20000) { this.setError("Name must be 120 characters or fewer and prompt text 20,000 characters or fewer."); return; }
     const tags = normalizeTags(text(draft.tags).split(",").map((tag) => tag.slice(0, MAX_TAG_LENGTH)));
+    const loras = (Array.isArray(draft.loras) ? draft.loras : []).map((lora) => ({
+      name: text(lora?.name).trim(),
+      strength_model: Number(lora?.strength_model),
+      strength_clip: Number(lora?.strength_clip),
+    }));
+    if (loras.some((lora) => !lora.name)) { this.setError("Each attached LoRA needs a filename."); return; }
+    if (new Set(loras.map((lora) => lora.name.toLocaleLowerCase())).size !== loras.length) { this.setError("A concept cannot attach the same LoRA more than once."); return; }
+    if (loras.some((lora) => !Number.isFinite(lora.strength_model) || !Number.isFinite(lora.strength_clip) || Math.abs(lora.strength_model) > 100 || Math.abs(lora.strength_clip) > 100)) { this.setError("LoRA strengths must be numbers from -100 to 100."); return; }
     this.setBusy(true);
     try {
-      const body = { category: this.activeCategory, name, prompt, tags, favorite: draft.favorite === true, folder_id: draft.folder_id || null };
+      const body = { category: this.activeCategory, name, prompt, tags, loras, favorite: draft.favorite === true, folder_id: draft.folder_id || null };
       const payload = draft.id ? await requestJSON(`${API_BASE}/entries/${encodeURIComponent(draft.id)}`, requestOptions("PUT", body)) : await requestJSON(`${API_BASE}/entries`, requestOptions("POST", body));
       const saved = entryFromPayload(payload);
       await this.refreshLibrary();
@@ -1157,6 +1575,11 @@ class MasterPromptLibraryV2Modal {
       variant: "danger",
     });
     if (!confirmed) return;
+    const visibleBeforeDelete = this.visibleEntries();
+    const deletedIndex = visibleBeforeDelete.findIndex((candidate) => candidate.id === entry.id);
+    this.pendingCatalogFocusId = visibleBeforeDelete[deletedIndex + 1]?.id
+      || visibleBeforeDelete[deletedIndex - 1]?.id
+      || null;
     this.setBusy(true);
     try {
       await requestJSON(`${API_BASE}/entries/${encodeURIComponent(entry.id)}`, { method: "DELETE" });
@@ -1388,13 +1811,13 @@ class MasterPromptLibraryV2Modal {
     finally { this.galleryBusy = false; this.render(); }
   }
 
-  async reorderImages(entry, visibleImages, from, to) {
+  async reorderImages(entry, visibleImages, from, to, kind = this.galleryKind) {
     if (from === to || from < 0 || to < 0 || from >= visibleImages.length || to >= visibleImages.length) return;
     const visibleIds = reorderIds(visibleImages.map((image) => image.id), from, to);
     const positions = new Map(visibleIds.map((id, index) => [id, index]));
     const byId = new Map(entry.images.map((image) => [image.id, image]));
     let nextVisible = 0;
-    const reordered = entry.images.map((image) => image.kind === this.galleryKind ? byId.get(visibleIds[nextVisible++]) : image);
+    const reordered = entry.images.map((image) => image.kind === kind ? byId.get(visibleIds[nextVisible++]) : image);
     await this.saveImageMetadata(entry, {}, reordered);
   }
 
@@ -1527,6 +1950,7 @@ class MasterPromptLibraryV2Modal {
   }
 
   initExtractImageState() {
+    if (this.extractState?.previewUrl) URL.revokeObjectURL(this.extractState.previewUrl);
     this.extractState = {
       file: null,
       previewUrl: "",
@@ -1537,74 +1961,179 @@ class MasterPromptLibraryV2Modal {
       tags: "",
       source: "",
       sections: {},
+      structured: null,
+      selectedExtractedField: "positive_prompt",
+      selectedExtractionFields: ["positive_prompt"],
+      extractedFieldDrafts: { positive_prompt: "" },
       busy: false,
-      apiEndpoint: this.extractState?.apiEndpoint || "",
+      provider: this.extractState?.provider || "ollama",
+      apiEndpoint: this.extractState?.apiEndpoint || "http://127.0.0.1:11434/v1",
       apiKey: this.extractState?.apiKey || "",
-      apiModel: this.extractState?.apiModel || "gpt-4o-mini",
+      apiModel: this.extractState?.apiModel || "llava",
+      rememberApiKey: this.extractState?.rememberApiKey !== false,
+      visionModels: normalizeVisionModels(this.extractState?.visionModels, this.extractState?.apiModel),
+      visionModelsLoading: false,
+      visionModelsError: "",
+      customModel: Boolean(this.extractState?.customModel),
+    };
+  }
+
+  persistVisionConnection() {
+    return saveVisionConnection(this.extractState);
+  }
+
+  setVisionProvider(providerId) {
+    const next = connectionForProvider(providerId, this.extractState);
+    Object.assign(this.extractState, next, {
+      visionModels: normalizeVisionModels([], next.apiModel),
+      visionModelsError: "",
+      customModel: false,
+    });
+    this.persistVisionConnection();
+    this.render();
+    void this.refreshVisionModels({ silent: true });
+  }
+
+  forgetVisionSettings() {
+    forgetVisionConnection();
+    const next = connectionForProvider("ollama", { rememberApiKey: true });
+    Object.assign(this.extractState, next, {
+      visionModels: normalizeVisionModels([], next.apiModel),
+      visionModelsLoading: false,
+      visionModelsError: "",
+      customModel: false,
+    });
+    this.setStatus("Forgot the saved Vision API connection on this browser.");
+    this.render();
+  }
+
+  async refreshVisionModels({ silent = false } = {}) {
+    const state = this.extractState;
+    const endpoint = text(state?.apiEndpoint).trim();
+    const apiKey = text(state?.apiKey).trim();
+    if (!endpoint || state?.visionModelsLoading) return;
+    state.visionModelsLoading = true;
+    state.visionModelsError = "";
+    this.render();
+    try {
+      const response = await requestJSON(`${API_BASE}/vision/models`, requestOptions("POST", {
+        api_endpoint: endpoint,
+        api_key: apiKey,
+      }));
+      if (this.extractState !== state || text(state.apiEndpoint).trim() !== endpoint || text(state.apiKey).trim() !== apiKey) return;
+      const models = normalizeVisionModels(response?.models, state.apiModel);
+      state.visionModels = models;
+      if (!state.apiModel && models.length) state.apiModel = models[0];
+      state.customModel = false;
+      this.persistVisionConnection();
+      this.setStatus(models.length ? `Loaded ${models.length} model${models.length === 1 ? "" : "s"} from the Vision API.` : "The Vision API returned no models; use Custom model.");
+    } catch (error) {
+      if (this.extractState !== state) return;
+      state.visionModelsError = trimError(error);
+      if (!silent) this.setError(error);
+    } finally {
+      if (this.extractState === state) {
+        state.visionModelsLoading = false;
+        this.render();
+      }
+    }
+  }
+
+  invalidateExtractRequests() {
+    const previous = this.extractState;
+    if (!previous || typeof previous !== "object") return;
+    if (previous.previewUrl) URL.revokeObjectURL(previous.previewUrl);
+    this.extractState = {
+      ...previous,
+      file: null,
+      previewUrl: "",
+      prompt: "",
+      suggestedName: "",
+      source: "",
+      sections: {},
+      structured: null,
+      selectedExtractedField: "positive_prompt",
+      selectedExtractionFields: ["positive_prompt"],
+      extractedFieldDrafts: { positive_prompt: "" },
+      busy: false,
     };
   }
 
   async processExtractFile(file) {
-    if (!file || this.extractState.busy) return;
-    this.extractState.file = file;
-    if (this.extractState.previewUrl) URL.revokeObjectURL(this.extractState.previewUrl);
-    this.extractState.previewUrl = URL.createObjectURL(file);
-    this.extractState.busy = true;
-    this.extractState.prompt = "";
-    this.extractState.source = "";
-    this.extractState.sections = {};
+    const state = this.extractState;
+    if (!file || state.busy) return;
+    const requestToken = extractionRequestToken(state);
+    this.clearError();
+    state.file = file;
+    if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
+    state.previewUrl = URL.createObjectURL(file);
+    state.busy = true;
+    state.prompt = "";
+    state.source = "";
+    state.sections = {};
+    state.structured = null;
+    state.selectedExtractedField = "positive_prompt";
+    state.selectedExtractionFields = ["positive_prompt"];
+    state.extractedFieldDrafts = { positive_prompt: "" };
     this.render();
 
     try {
       const form = new FormData();
       form.append("image", file, file.name);
-      if (this.extractState.apiEndpoint) {
-        form.append("api_endpoint", this.extractState.apiEndpoint);
-        if (this.extractState.apiKey) form.append("api_key", this.extractState.apiKey);
-        if (this.extractState.apiModel) form.append("api_model", this.extractState.apiModel);
-      }
       const response = await requestJSON(`${API_BASE}/extract_image`, { method: "POST", body: form });
-      this.extractState.prompt = response?.prompt || "";
-      this.extractState.source = response?.source || "none";
-      this.extractState.suggestedName = response?.suggested_name || suggestEntryName(this.extractState.prompt, file.name);
-      this.extractState.sections = response?.sections || parsePromptSections(this.extractState.prompt, this.categories().map(c => c.name));
-      this.setStatus(this.extractState.prompt ? `Extracted positive prompt (${this.extractState.source}).` : "No prompt metadata found in this image.");
+      if (!runIfCurrentExtractionRequest(this.extractState, requestToken, () => {
+        Object.assign(state, applyExtractionResponse(state, response, { filename: file.name, categoryNames: this.categories().map(c => c.name), categories: this.categories() }));
+        this.setStatus(state.prompt ? `Extracted positive prompt (${state.source}).` : "No prompt metadata found in this image.");
+      })) return;
     } catch (error) {
-      this.setError(error);
+      runIfCurrentExtractionRequest(this.extractState, requestToken, () => this.setError(error));
     } finally {
-      this.extractState.busy = false;
-      this.render();
+      runIfCurrentExtractionRequest(this.extractState, requestToken, () => {
+        state.busy = false;
+        this.render();
+      });
     }
   }
 
   async runVisionExtraction() {
-    if (!this.extractState.file || this.extractState.busy) {
+    const state = this.extractState;
+    if (!state.file || state.busy) {
       this.setError("Choose an image file first.");
       return;
     }
-    if (!this.extractState.apiEndpoint) {
+    if (!state.apiEndpoint) {
       this.setError("Please enter a Vision API endpoint (e.g. http://localhost:11434/v1 or OpenAI URL).");
       return;
     }
-    this.extractState.busy = true;
+    if (!state.apiModel) {
+      this.setError("Choose a discovered model or enter a custom model ID.");
+      return;
+    }
+    this.persistVisionConnection();
+    const requestToken = extractionRequestToken(state);
+    const file = state.file;
+    this.clearError();
+    state.busy = true;
     this.render();
     try {
       const form = new FormData();
-      form.append("image", this.extractState.file, this.extractState.file.name);
-      form.append("api_endpoint", this.extractState.apiEndpoint);
-      if (this.extractState.apiKey) form.append("api_key", this.extractState.apiKey);
-      if (this.extractState.apiModel) form.append("api_model", this.extractState.apiModel);
+      form.append("image", file, file.name);
+      const fields = visionExtractionRequestFields(state);
+      for (const [key, value] of Object.entries(fields)) {
+        if (value || key === "force_vision") form.append(key, value);
+      }
       const response = await requestJSON(`${API_BASE}/extract_image`, { method: "POST", body: form });
-      this.extractState.prompt = response?.prompt || "";
-      this.extractState.source = "vision";
-      this.extractState.suggestedName = response?.suggested_name || suggestEntryName(this.extractState.prompt, this.extractState.file.name);
-      this.extractState.sections = response?.sections || parsePromptSections(this.extractState.prompt, this.categories().map(c => c.name));
-      this.setStatus("Vision interrogation completed.");
+      if (!runIfCurrentExtractionRequest(this.extractState, requestToken, () => {
+        Object.assign(state, applyExtractionResponse(state, response, { filename: file.name, categoryNames: this.categories().map(c => c.name), categories: this.categories(), requirePrompt: true }));
+        this.setStatus(`Vision interrogation completed (${state.source}).`);
+      })) return;
     } catch (error) {
-      this.setError(error);
+      runIfCurrentExtractionRequest(this.extractState, requestToken, () => this.setError(error));
     } finally {
-      this.extractState.busy = false;
-      this.render();
+      runIfCurrentExtractionRequest(this.extractState, requestToken, () => {
+        state.busy = false;
+        this.render();
+      });
     }
   }
 
@@ -1617,7 +2146,7 @@ class MasterPromptLibraryV2Modal {
       element("span", { textContent: "Metadata & Vision" }),
     ]));
 
-    const dropzone = element("div", { className: "mpl2-dropzone", tabindex: "0", role: "button", "aria-label": "Drop image here or click to browse" }, [
+    const dropzone = element("label", { className: "mpl2-dropzone", for: "mpl2-extract-file", "aria-label": "Drop image here or click to browse" }, [
       element("span", { className: "mpl2-dropzone-icon", textContent: "📷", "aria-hidden": "true" }),
       element("span", { className: "mpl2-dropzone-text", textContent: "Drop PNG, WebP, or JPEG image here" }),
       element("span", { className: "mpl2-dropzone-hint", textContent: "or click to select file from disk" }),
@@ -1626,14 +2155,15 @@ class MasterPromptLibraryV2Modal {
     const hiddenFile = element("input", {
       className: "mpl2-hidden-file",
       type: "file",
+      id: "mpl2-extract-file",
+      tabindex: "0",
       accept: "image/png,image/webp,image/jpeg,.png,.webp,.jpg,.jpeg",
-      "aria-label": "Select image file",
+      "aria-label": "Drop image here or click to browse",
     });
     hiddenFile.addEventListener("change", () => {
       if (hiddenFile.files?.length) this.processExtractFile(hiddenFile.files[0]);
     });
 
-    dropzone.addEventListener("click", () => hiddenFile.click());
     dropzone.addEventListener("dragover", (e) => { e.preventDefault(); dropzone.classList.add("is-dragover"); });
     dropzone.addEventListener("dragleave", () => dropzone.classList.remove("is-dragover"));
     dropzone.addEventListener("drop", (e) => {
@@ -1642,36 +2172,122 @@ class MasterPromptLibraryV2Modal {
       if (e.dataTransfer?.files?.length) this.processExtractFile(e.dataTransfer.files[0]);
     });
 
+    const provider = visionProvider(this.extractState.provider);
+    const providerSelect = element("select", { id: "mpl2-vision-provider", className: "mpl2-select" },
+      VISION_PROVIDERS.map((candidate) => element("option", { value: candidate.id, textContent: candidate.label })));
+    providerSelect.value = provider.id;
+    providerSelect.addEventListener("change", () => this.setVisionProvider(providerSelect.value));
+
+    const keyInput = element("input", {
+      id: "mpl2-vision-key",
+      className: "mpl2-input",
+      type: "password",
+      autocomplete: "off",
+      placeholder: provider.keyRequired ? "API key" : "Optional",
+      value: this.extractState.apiKey || "",
+      oninput: (event) => { this.extractState.apiKey = event.target.value; },
+      onchange: () => { this.persistVisionConnection(); void this.refreshVisionModels({ silent: true }); },
+    });
+
+    const modelValues = normalizeVisionModels(this.extractState.visionModels, this.extractState.apiModel);
+    const modelSelect = element("select", {
+      id: "mpl2-vision-model",
+      className: "mpl2-select",
+      disabled: this.extractState.visionModelsLoading,
+      "aria-describedby": "mpl2-vision-model-status",
+    }, [
+      ...modelValues.map((model) => element("option", { value: model, textContent: model })),
+      element("option", { value: "__custom__", textContent: "Custom model…" }),
+    ]);
+    modelSelect.value = this.extractState.customModel || !modelValues.length ? "__custom__" : this.extractState.apiModel;
+    modelSelect.addEventListener("change", () => {
+      if (modelSelect.value === "__custom__") {
+        this.extractState.customModel = true;
+        this.render();
+        return;
+      }
+      this.extractState.customModel = false;
+      this.extractState.apiModel = modelSelect.value;
+      this.persistVisionConnection();
+    });
+    const modelRefresh = this.actionButton(this.extractState.visionModelsLoading ? "Loading…" : "Refresh", "", () => this.refreshVisionModels());
+    modelRefresh.disabled = this.extractState.visionModelsLoading || !this.extractState.apiEndpoint;
+    const modelControls = element("div", { className: "mpl2-vision-model-controls" }, [modelSelect, modelRefresh]);
+
+    const customModelInput = element("input", {
+      className: "mpl2-input",
+      placeholder: "Enter a custom model ID",
+      value: this.extractState.apiModel || "",
+      oninput: (event) => { this.extractState.apiModel = event.target.value; },
+      onchange: () => this.persistVisionConnection(),
+      "aria-label": "Custom Vision API model ID",
+    });
+
+    const endpointInput = element("input", {
+      id: "mpl2-vision-endpoint",
+      className: "mpl2-input",
+      placeholder: "OpenAI-compatible base URL",
+      value: this.extractState.apiEndpoint || "",
+      oninput: (event) => { this.extractState.apiEndpoint = event.target.value; },
+      onchange: () => { this.persistVisionConnection(); void this.refreshVisionModels({ silent: true }); },
+    });
+
+    const rememberKey = element("input", { type: "checkbox", checked: this.extractState.rememberApiKey !== false });
+    rememberKey.addEventListener("change", () => {
+      this.extractState.rememberApiKey = rememberKey.checked;
+      this.persistVisionConnection();
+    });
+
+    const modelStatus = this.extractState.visionModelsLoading
+      ? "Contacting the provider…"
+      : this.extractState.visionModelsError
+        ? `Model discovery unavailable: ${this.extractState.visionModelsError}`
+        : modelValues.length
+          ? `${modelValues.length} model${modelValues.length === 1 ? "" : "s"} available.`
+          : "Choose Refresh, or use a custom model ID.";
+
+    const visionActions = element("div", { className: "mpl2-vision-actions" }, [
+      this.actionButton("Run Vision Interrogation", "primary", () => this.runVisionExtraction()),
+      this.actionButton("Forget saved connection", "", () => this.forgetVisionSettings()),
+    ]);
+
+    const connectionDetails = element("details", { className: "mpl2-vision-advanced", open: provider.id === "custom" }, [
+      element("summary", { textContent: "Connection details" }),
+      element("div", { className: "mpl2-vision-advanced-fields" }, [
+        element("label", { className: "mpl2-field-label", for: "mpl2-vision-endpoint", textContent: "API Endpoint" }),
+        endpointInput,
+        element("label", { className: "mpl2-vision-remember" }, [
+          rememberKey,
+          element("span", { textContent: "Remember API key in this browser profile" }),
+        ]),
+        element("p", { className: "mpl2-vision-storage-note", textContent: "The endpoint, model, and provider are saved locally. Uncheck this before leaving a shared browser." }),
+      ]),
+    ]);
+
     const visionDetails = element("details", { className: "mpl2-vision-config" }, [
-      element("summary", { textContent: "Vision API Interrogation (Optional)" }),
+      element("summary", { textContent: `Vision API · ${provider.label}` }),
       element("div", { className: "mpl2-vision-fields" }, [
-        element("label", { className: "mpl2-field-label", textContent: "API Endpoint" }),
-        element("input", {
-          className: "mpl2-input",
-          placeholder: "e.g. http://localhost:11434/v1 or https://api.openai.com/v1",
-          value: this.extractState.apiEndpoint || "",
-          oninput: (e) => { this.extractState.apiEndpoint = e.target.value; },
-        }),
-        element("label", { className: "mpl2-field-label", textContent: "API Key (if required)" }),
-        element("input", {
-          className: "mpl2-input",
-          type: "password",
-          placeholder: "sk-...",
-          value: this.extractState.apiKey || "",
-          oninput: (e) => { this.extractState.apiKey = e.target.value; },
-        }),
-        element("label", { className: "mpl2-field-label", textContent: "Model" }),
-        element("input", {
-          className: "mpl2-input",
-          placeholder: "gpt-4o-mini / llava / qwen2.5-vl",
-          value: this.extractState.apiModel || "gpt-4o-mini",
-          oninput: (e) => { this.extractState.apiModel = e.target.value; },
-        }),
-        this.actionButton("Run Vision Interrogation", "", () => this.runVisionExtraction()),
+        element("div", { className: "mpl2-vision-field" }, [
+          element("label", { className: "mpl2-field-label", for: "mpl2-vision-provider", textContent: "Provider" }),
+          providerSelect,
+        ]),
+        element("div", { className: "mpl2-vision-field" }, [
+          element("label", { className: "mpl2-field-label", for: "mpl2-vision-key", textContent: provider.keyRequired ? "API Key" : "API Key (optional)" }),
+          keyInput,
+        ]),
+        element("div", { className: "mpl2-vision-field mpl2-vision-model-field" }, [
+          element("label", { className: "mpl2-field-label", for: "mpl2-vision-model", textContent: "Model" }),
+          modelControls,
+          (this.extractState.customModel || !modelValues.length) ? customModelInput : null,
+          element("p", { id: "mpl2-vision-model-status", className: "mpl2-vision-model-status", textContent: modelStatus, role: "status", "aria-live": "polite" }),
+        ]),
+        connectionDetails,
+        visionActions,
       ]),
     ]);
 
     const backButton = this.actionButton("Back to archive", "", () => {
+      this.invalidateExtractRequests();
       this.mode = "browse";
       this.render();
     });
@@ -1690,7 +2306,15 @@ class MasterPromptLibraryV2Modal {
       return;
     }
 
-    if (!this.extractState.file && !this.extractState.prompt) {
+    const extractedFields = extractionFieldOptions(this.extractState);
+    const activeField = extractedFields.find((field) => field.key === this.extractState.selectedExtractedField)
+      || extractedFields[0]
+      || { key: "positive_prompt", label: "Positive Prompt", value: selectedExtractionDraft(this.extractState) };
+    if (extractedFields.length && activeField.key !== this.extractState.selectedExtractedField) {
+      Object.assign(this.extractState, selectExtractionField(this.extractState, activeField.key));
+    }
+
+    if (!this.extractState.file && !activeField.value.trim()) {
       this.detailPane.appendChild(element("p", { className: "mpl2-empty", textContent: "Drop or select an image on the left to extract prompt metadata or run vision interrogation." }));
       return;
     }
@@ -1712,18 +2336,75 @@ class MasterPromptLibraryV2Modal {
       badge,
       element("p", { className: "mpl2-tray-note", textContent: this.extractState.file ? `${this.extractState.file.name} (${(this.extractState.file.size / 1024).toFixed(1)} KB)` : "" }),
     ]);
+    const confidence = this.extractState.structured?.confidence;
+    if (typeof confidence === "number" && Number.isFinite(confidence)) {
+      previewMeta.appendChild(element("p", { className: "mpl2-tray-note", textContent: `Confidence: ${confidence}` }));
+    }
     previewRow.appendChild(previewMeta);
 
-    const promptLabel = element("label", { className: "mpl2-field-label", textContent: "Extracted Positive Prompt" });
+    const extractedFieldControls = [];
+    if (extractedFields.length > 1) {
+      const fieldLabel = element("label", { className: "mpl2-field-label", textContent: "Field to Edit" });
+      const extractedFieldSelect = this.setFocusKey(element("select", { className: "mpl2-select", "aria-label": "Field to edit" }), "extracted-field");
+      for (const field of extractedFields) {
+        extractedFieldSelect.appendChild(element("option", { value: field.key, textContent: field.label }));
+      }
+      extractedFieldSelect.value = activeField.key;
+      extractedFieldSelect.addEventListener("change", () => {
+        Object.assign(this.extractState, selectExtractionField(this.extractState, extractedFieldSelect.value));
+        this.render();
+      });
+      extractedFieldControls.push(fieldLabel, extractedFieldSelect);
+    }
+
+    const selectedForSave = new Set(selectedExtractionFields(this.extractState));
+    const selectionRows = [];
+    for (const field of extractedFields) {
+      const destination = extractionCategoryForField(field.key, this.categories(), this.extractState.targetCategory);
+      const canSave = Boolean(field.value.trim() && destination);
+      if (!canSave && selectedForSave.has(field.key)) {
+        Object.assign(this.extractState, toggleExtractionFieldSelection(this.extractState, field.key, false));
+        selectedForSave.delete(field.key);
+      }
+      const checkbox = element("input", {
+        type: "checkbox",
+        checked: selectedForSave.has(field.key),
+        disabled: !canSave,
+        "aria-label": `Add ${field.label} to library`,
+      });
+      checkbox.addEventListener("change", () => {
+        Object.assign(this.extractState, toggleExtractionFieldSelection(this.extractState, field.key, checkbox.checked));
+        this.renderExtractImagePane();
+      });
+      selectionRows.push(element("label", { className: `mpl2-extraction-choice${canSave ? "" : " is-unavailable"}` }, [
+        checkbox,
+        element("span", { className: "mpl2-extraction-choice-name", textContent: field.label }),
+        element("span", {
+          className: "mpl2-extraction-choice-target",
+          textContent: destination ? `→ ${categoryLabel(destination)}` : "No matching category",
+        }),
+      ]));
+    }
+    const selectionFieldset = extractedFields.length > 1
+      ? element("fieldset", { className: "mpl2-extraction-selection" }, [
+        element("legend", { textContent: "Fields to Add" }),
+        element("div", { className: "mpl2-extraction-choices" }, selectionRows),
+        element("p", { className: "mpl2-extraction-selection-note", textContent: "Each checked field becomes its own library entry. Unmatched fields need a category with the same name." }),
+      ])
+      : null;
+
+    const promptLabel = element("label", { className: "mpl2-field-label", textContent: `Extracted ${activeField.label}` });
     const promptTextarea = element("textarea", {
       className: "mpl2-textarea",
       rows: "6",
       "aria-label": "Extracted prompt text",
     });
-    promptTextarea.value = this.extractState.prompt;
+    promptTextarea.value = selectedExtractionDraft(this.extractState);
     promptTextarea.addEventListener("input", () => {
-      this.extractState.prompt = promptTextarea.value;
-      this.extractState.sections = parsePromptSections(this.extractState.prompt, this.categories().map(c => c.name));
+      Object.assign(this.extractState, updateExtractionFieldDraft(this.extractState, promptTextarea.value));
+      if (!this.extractState.structured) {
+        this.extractState.sections = parsePromptSections(this.extractState.prompt, this.categories().map(c => c.name));
+      }
     });
 
     const sectionKeys = Object.keys(this.extractState.sections || {});
@@ -1731,12 +2412,16 @@ class MasterPromptLibraryV2Modal {
     if (sectionKeys.length) {
       const tagList = element("div", { className: "mpl2-section-tags" });
       for (const k of sectionKeys) {
-        tagList.appendChild(element("span", { className: "mpl2-section-tag", textContent: `${k}: ${this.extractState.sections[k].slice(0, 30)}…` }));
+        const sectionText = String(this.extractState.sections[k] || "").trim();
+        tagList.appendChild(element("span", {
+          className: "mpl2-section-tag",
+          textContent: `${k}: ${sectionText}`,
+        }));
       }
       sectionWrap.append(element("label", { className: "mpl2-field-label", textContent: "Detected Sections" }), tagList);
     }
 
-    const categoryLabelEl = element("label", { className: "mpl2-field-label", textContent: "Target Category" });
+    const categoryLabelEl = element("label", { className: "mpl2-field-label", textContent: extractedFields.length > 1 ? "Positive Prompt Target Category" : "Target Category" });
     const categorySelect = element("select", { className: "mpl2-select", "aria-label": "Target library category" });
     for (const cat of this.categories()) {
       categorySelect.appendChild(element("option", { value: cat.id, textContent: categoryLabel(cat) }));
@@ -1747,7 +2432,7 @@ class MasterPromptLibraryV2Modal {
       this.renderExtractImagePane();
     });
 
-    const nameLabel = element("label", { className: "mpl2-field-label", textContent: "Entry Name" });
+    const nameLabel = element("label", { className: "mpl2-field-label", textContent: extractedFields.length > 1 ? "Base Entry Name" : "Entry Name" });
     const nameInput = element("input", {
       className: "mpl2-input",
       value: this.extractState.suggestedName,
@@ -1781,7 +2466,10 @@ class MasterPromptLibraryV2Modal {
       this.extractState.tags = tagsInput.value;
     });
 
-    const addToLibraryBtn = this.actionButton("＋ Add to Library", "primary", () => this.saveExtractedToLibrary());
+    const savePlan = extractionSavePlan(this.extractState, this.categories());
+    const addLabel = savePlan.entries.length > 1 ? `＋ Add ${savePlan.entries.length} Fields to Library` : "＋ Add to Library";
+    const addToLibraryBtn = this.actionButton(addLabel, "primary", () => this.saveExtractedToLibrary());
+    addToLibraryBtn.disabled = savePlan.entries.length === 0;
     const applyToNodeBtn = this.actionButton("Apply to Active Node", "", () => this.applyExtractedToNode());
     const copyBtn = this.actionButton("Copy Prompt", "", () => this.copyExtractedPrompt());
 
@@ -1794,6 +2482,8 @@ class MasterPromptLibraryV2Modal {
     this.detailPane.append(
       detailHeader,
       previewRow,
+      ...extractedFieldControls,
+      selectionFieldset,
       promptLabel,
       promptTextarea,
       sectionWrap,
@@ -1810,47 +2500,72 @@ class MasterPromptLibraryV2Modal {
   }
 
   async saveExtractedToLibrary() {
-    const promptText = text(this.extractState.prompt).trim();
-    const entryName = text(this.extractState.suggestedName).trim() || "Extracted Prompt";
-    const categoryId = this.extractState.targetCategory || this.categories()[0]?.id || "style";
-    if (!promptText) {
-      this.setError("Prompt text cannot be empty.");
+    const plan = extractionSavePlan(this.extractState, this.categories());
+    if (plan.unmatched.length) {
+      this.setError(`No matching library category for: ${plan.unmatched.map((field) => field.label).join(", ")}.`);
+      return;
+    }
+    if (plan.empty.length) {
+      this.setError(`Selected fields cannot be empty: ${plan.empty.map((field) => field.label).join(", ")}.`);
+      return;
+    }
+    if (!plan.entries.length) {
+      this.setError("Choose at least one extracted field to add.");
+      return;
+    }
+
+    const conflicts = plan.entries.filter((operation) => {
+      const category = this.categories().find((candidate) => candidate.id === operation.category);
+      const wanted = operation.name.trim().toLocaleLowerCase();
+      return category?.entries.some((entry) => text(entry.name).trim().toLocaleLowerCase() === wanted);
+    });
+    if (conflicts.length) {
+      this.setError(`Entry name already exists: ${conflicts.map((operation) => operation.name).join(", ")}.`);
       return;
     }
     if (this.busy) return;
     this.setBusy(true);
+    const createdEntries = [];
 
     try {
       const tagList = normalizeTags(this.extractState.tags.split(","));
-      const body = {
-        name: entryName,
-        prompt: promptText,
-        category: categoryId,
-        folder_id: this.extractState.folderId || null,
-        tags: tagList,
-      };
+      for (const operation of plan.entries) {
+        const payload = await requestJSON(`${API_BASE}/entries`, requestOptions("POST", {
+          name: operation.name,
+          prompt: operation.prompt,
+          category: operation.category,
+          folder_id: operation.folder_id,
+          tags: tagList,
+        }));
+        const entry = payload?.entry || payload;
+        createdEntries.push({ ...operation, entry });
 
-      const payload = await requestJSON(`${API_BASE}/entries`, requestOptions("POST", body));
-      const entry = payload?.entry || payload;
-
-      if (this.extractState.file && entry?.id) {
-        try {
-          const form = new FormData();
-          form.append("kind", "preview");
-          form.append("file", this.extractState.file, this.extractState.file.name);
-          await requestJSON(`${API_BASE}/entries/${encodeURIComponent(entry.id)}/images`, { method: "POST", body: form });
-        } catch {
-          // Non-fatal image upload error
+        if (this.extractState.file && entry?.id) {
+          try {
+            const form = new FormData();
+            form.append("kind", "preview");
+            form.append("file", this.extractState.file, this.extractState.file.name);
+            await requestJSON(`${API_BASE}/entries/${encodeURIComponent(entry.id)}/images`, { method: "POST", body: form });
+          } catch {
+            // Non-fatal image upload error
+          }
         }
       }
 
       await this.refreshLibrary();
-      this.activeCategory = categoryId;
-      this.selectedId = entry?.id || null;
+      this.activeCategory = createdEntries[0]?.category || this.activeCategory;
+      this.selectedId = createdEntries[0]?.entry?.id || null;
       this.mode = "browse";
-      this.setStatus(`Added “${entryName}” to ${categoryLabel(this.activeCategoryObject())}.`);
+      this.setStatus(createdEntries.length === 1
+        ? `Added “${createdEntries[0].name}” to ${categoryLabel(this.activeCategoryObject())}.`
+        : `Added ${createdEntries.length} extracted fields to the library.`);
     } catch (error) {
-      this.setError(error);
+      if (createdEntries.length) {
+        await this.refreshLibrary();
+        this.setError(`Added ${createdEntries.length} field${createdEntries.length === 1 ? "" : "s"}, then stopped: ${trimError(error)}`);
+      } else {
+        this.setError(error);
+      }
     } finally {
       this.setBusy(false);
       this.render();
@@ -1858,7 +2573,7 @@ class MasterPromptLibraryV2Modal {
   }
 
   applyExtractedToNode() {
-    const promptText = text(this.extractState.prompt).trim();
+    const promptText = selectedExtractionDraft(this.extractState).trim();
     if (!promptText) {
       this.setError("No extracted prompt to apply.");
       return;
@@ -1880,7 +2595,7 @@ class MasterPromptLibraryV2Modal {
   }
 
   async copyExtractedPrompt() {
-    const promptText = text(this.extractState.prompt).trim();
+    const promptText = selectedExtractionDraft(this.extractState).trim();
     if (!promptText) return;
     try {
       if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
@@ -1937,9 +2652,15 @@ function getModal() {
 }
 
 function addBrowseButton(node, knownV2 = false) {
-  if ((!knownV2 && !isV2Node(node)) || node.__masterPromptLibraryV2Button) return;
-  hideSerializedWidget(widget(node, "selection_state"));
-  hideSerializedWidget(widget(node, "component_order"));
+  if (!knownV2 && !isV2Node(node)) return false;
+  const attachedButton = node.__masterPromptLibraryV2Button;
+  if (attachedButton && node.widgets?.includes(attachedButton)) return true;
+  if (attachedButton) delete node.__masterPromptLibraryV2Button;
+  const selectionWidget = widget(node, "selection_state");
+  const orderWidget = widget(node, "component_order");
+  if (!selectionWidget || !orderWidget || typeof node.addWidget !== "function") return false;
+  hideSerializedWidget(selectionWidget);
+  hideSerializedWidget(orderWidget);
   const button = node.addWidget?.("button", "Choose Components", null, () => getModal().open(node), { serialize: false });
   if (button) {
     button.serialize = false;
@@ -1961,6 +2682,15 @@ function addBrowseButton(node, knownV2 = false) {
     onSelectionChange: (library) => updateNodeSummaries(library),
   });
   node.setDirtyCanvas?.(true, true);
+  return Boolean(button);
+}
+
+function scheduleBrowseButton(node, knownV2 = false) {
+  for (const delay of [0, 50, 250, 1000]) {
+    setTimeout(() => {
+      if (!node?.__masterPromptLibraryV2Button) addBrowseButton(node, knownV2);
+    }, delay);
+  }
 }
 
 function hookV2Node(nodeType, nodeData) {
@@ -1970,7 +2700,7 @@ function hookV2Node(nodeType, nodeData) {
   const original = prototype.onNodeCreated;
   prototype.onNodeCreated = function masterPromptLibraryV2OnNodeCreated(...args) {
     const result = typeof original === "function" ? original.apply(this, args) : undefined;
-    const defer = () => queueMicrotask(() => addBrowseButton(this, true));
+    const defer = () => scheduleBrowseButton(this, true);
     if (result && typeof result.then === "function") return result.then((value) => { defer(); return value; });
     defer(); return result;
   };
@@ -1980,8 +2710,8 @@ function hookV2Node(nodeType, nodeData) {
 app.registerExtension({
   name: EXTENSION_NAME,
   init() { ensureStyles(); },
-  afterConfigureGraph() { queueMicrotask(() => nodesInOpenGraph().forEach((node) => addBrowseButton(node))); },
+  afterConfigureGraph() { nodesInOpenGraph().forEach((node) => scheduleBrowseButton(node)); },
   beforeRegisterNodeDef(nodeType, nodeData) { hookV2Node(nodeType, nodeData); },
-  nodeCreated(node) { queueMicrotask(() => addBrowseButton(node)); },
-  loadedGraphNode(node) { queueMicrotask(() => addBrowseButton(node)); },
+  nodeCreated(node) { scheduleBrowseButton(node); },
+  loadedGraphNode(node) { scheduleBrowseButton(node); },
 });

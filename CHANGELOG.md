@@ -2,6 +2,12 @@
 
 ## 2.1.0 - 2026-08-21
 
+- Added per-concept LoRA attachments to the v2 library manager. Selected concepts
+  now apply their configured model/CLIP strengths through optional node inputs,
+  with deterministic de-duplication and JSON conflict reporting.
+- Replaced the image-extraction Vision API text-box cluster with persisted provider
+  presets, optional browser-local API-key retention, model discovery, a compact
+  provider/model picker, and an explicit forget action.
 - Added PEP 621 package metadata for `comfyui-master-prompt-library`, including
   the `2.1.0` version, Python 3.10-or-newer requirement, MIT license file, and
   an explicit empty third-party dependency list.

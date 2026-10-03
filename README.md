@@ -57,8 +57,12 @@ ordered selections per category. Its serialized inputs are:
 - `component_order`: compact JSON containing ordered category IDs plus the
   reserved `prompt` token.
 
-Its outputs are `combined_prompt`, `style_prompt`, `character_prompt`,
+Its first six outputs remain `combined_prompt`, `style_prompt`, `character_prompt`,
 `action_prompt`, `background_prompt`, and deterministic `components_json`.
+They are followed by `loras_json`, `model`, and `clip`. The optional `model` and
+`clip` inputs let selected concepts activate their attached LoRAs directly; when
+those inputs are left disconnected, prompt assembly still works and `loras_json`
+reports what would be activated.
 `combined_prompt` uses the node-local category order, includes only selected
 or non-empty sections, and labels each section with its current display name.
 The four compatibility outputs join all selected prompts in their category
@@ -68,6 +72,12 @@ validation error rather than a misleading prompt.
 
 The manager behind v2 adds ordered custom categories, tags, favorites, one
 flat folder per entry, and separate **Previews** and **Generated** galleries.
+Each concept can also attach up to 16 LoRAs from ComfyUI's configured LoRA
+folders, with independent model and CLIP strengths. Selecting that concept
+activates its attachments. If multiple selected concepts name the same LoRA,
+it is loaded once; the first attachment in component/selection order supplies
+the strengths and any later strength disagreement is reported in both JSON
+outputs.
 On the node, the component quick picker is collapsed by default. Expanding it
 provides category and search controls, six text-first rows per page,
 **Previous**/**Next**, and keyboard navigation. Its stable-ID toggles update
@@ -108,6 +118,12 @@ or external Vision APIs (e.g. local Ollama, OpenAI vision endpoints).
 In the Library Manager modal, clicking **Extract Image…** provides an interactive
 drag-and-drop zone with instant metadata extraction, prompt editing, category assignment,
 and one-click **Add to Library** (attaching the image as a preview) or **Apply to Active Node**.
+The Vision API panel includes presets for Ollama, OpenAI, Google Gemini, and custom
+OpenAI-compatible providers. It saves the selected provider, endpoint, and model in the
+current browser profile, can optionally retain the API key there, and discovers model IDs
+from the provider's OpenAI-compatible `/models` endpoint. A custom model ID remains
+available when discovery is unsupported or unavailable; **Forget saved connection** clears
+the stored profile.
 
 ## Bundled v2 core pack
 

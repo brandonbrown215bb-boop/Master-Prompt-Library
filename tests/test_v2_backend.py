@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
+import types
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from image_store import ImageStore
 from importers import discover_installed_sources, parse_csv, parse_directory, parse_json, parse_txt
 from library_store import CATEGORIES, LibraryStore, ValidationError
-from prompt_library_node import MasterPromptLibraryV2, set_library_store
+from prompt_library_node import MasterPromptLibraryV2, _apply_loras, set_library_store
 
 
 PNG = b"\x89PNG\r\n\x1a\nminimal"
@@ -63,6 +66,21 @@ class V2BackendTests(unittest.TestCase):
         self.assertIsNone(self.store.get_entry(entry["id"])["folder_id"])
         self.store.delete_folder(category["id"], folder["id"])
         self.assertEqual(self.store.get_entry(entry["id"])["folder_id"], None)
+
+    def test_entry_loras_are_validated_and_persisted(self) -> None:
+        entry = self.store.create_entry(
+            "style",
+            "LoRA concept",
+            "etched line work",
+            loras=[{"name": "styles/etched.safetensors", "strength_model": 0.8, "strength_clip": 0.65}],
+        )
+        self.assertEqual(entry["loras"], [{"name": "styles/etched.safetensors", "strength_model": 0.8, "strength_clip": 0.65}])
+        updated = self.store.update_entry(entry["id"], loras=[{"name": "styles/etched-v2.safetensors"}])
+        self.assertEqual(updated["loras"], [{"name": "styles/etched-v2.safetensors", "strength_model": 1.0, "strength_clip": 1.0}])
+        with self.assertRaises(ValidationError):
+            self.store.update_entry(entry["id"], loras=[{"name": "same.safetensors"}, {"name": "SAME.safetensors"}])
+        with self.assertRaises(ValidationError):
+            self.store.update_entry(entry["id"], loras=[{"name": "bad.safetensors", "strength_model": float("inf")}])
 
     def test_gallery_upload_reorder_primary_and_delete(self) -> None:
         entry = self.store.create_entry("style", "Gallery", "a prompt")
@@ -166,9 +184,61 @@ class V2BackendTests(unittest.TestCase):
         state = json.dumps({"version": 1, "selections": {"style": [second["id"], first["id"], second["id"], str(uuid.uuid4())]}})
         result = MasterPromptLibraryV2.assemble("", state, json.dumps(["style", "prompt"]))
         self.assertEqual(result[1], "two, one")
-        components = json.loads(result[-1])
+        components = json.loads(result[5])
         self.assertEqual([item["name"] for item in components["categories"][0]["selected"]], ["Second", "First"])
         self.assertEqual(len(components["missing_entry_ids"]), 1)
+
+    def test_v2_node_keeps_existing_output_indices_and_appends_lora_io(self) -> None:
+        set_library_store(self.store)
+        inputs = MasterPromptLibraryV2.INPUT_TYPES()
+        self.assertEqual(set(inputs["optional"]), {"model", "clip"})
+        self.assertEqual(MasterPromptLibraryV2.RETURN_NAMES[:6], (
+            "combined_prompt", "style_prompt", "character_prompt", "action_prompt", "background_prompt", "components_json",
+        ))
+        self.assertEqual(MasterPromptLibraryV2.RETURN_NAMES[6:], ("loras_json", "model", "clip"))
+
+    def test_v2_node_activates_selected_loras_once_and_reports_strength_conflicts(self) -> None:
+        first = self.store.create_entry("style", "First", "one", loras=[{"name": "shared.safetensors", "strength_model": 0.8, "strength_clip": 0.7}])
+        second = self.store.create_entry("style", "Second", "two", loras=[
+            {"name": "SHARED.safetensors", "strength_model": 0.4, "strength_clip": 0.5},
+            {"name": "detail.safetensors", "strength_model": 1.1, "strength_clip": 1.0},
+        ])
+        set_library_store(self.store)
+        state = json.dumps({"version": 1, "selections": {"style": [first["id"], second["id"]]}})
+        with patch("prompt_library_node._apply_loras", return_value=("loaded-model", "loaded-clip")) as apply_loras:
+            result = MasterPromptLibraryV2.assemble("", state, json.dumps(["style", "prompt"]), model="base-model", clip="base-clip")
+        activations = apply_loras.call_args.args[2]
+        self.assertEqual([item["name"] for item in activations], ["shared.safetensors", "detail.safetensors"])
+        self.assertEqual(len(activations[0]["sources"]), 2)
+        report = json.loads(result[6])
+        self.assertTrue(report["applied"])
+        self.assertEqual(len(report["conflicts"]), 1)
+        self.assertEqual(result[7:], ("loaded-model", "loaded-clip"))
+
+    def test_lora_runtime_applies_each_attachment_in_order(self) -> None:
+        comfy = types.ModuleType("comfy")
+        comfy.__path__ = []
+        comfy_sd = types.ModuleType("comfy.sd")
+        calls: list[tuple[object, object, object, float, float, object]] = []
+
+        def load_lora_for_models(model, clip, state, strength_model, strength_clip, lora_metadata=None):
+            calls.append((model, clip, state, strength_model, strength_clip, lora_metadata))
+            return f"{model}+{state}", f"{clip}+{state}"
+
+        comfy_sd.load_lora_for_models = load_lora_for_models
+        comfy.sd = comfy_sd
+        activations = [
+            {"name": "one.safetensors", "strength_model": 0.8, "strength_clip": 0.7},
+            {"name": "two.safetensors", "strength_model": 1.1, "strength_clip": 1.0},
+        ]
+        with patch.dict(sys.modules, {"comfy": comfy, "comfy.sd": comfy_sd}), patch(
+            "prompt_library_node._load_lora_state",
+            side_effect=[("state-one", {"source": "one"}), ("state-two", {"source": "two"})],
+        ):
+            model, clip = _apply_loras("model", "clip", activations)
+        self.assertEqual((model, clip), ("model+state-one+state-two", "clip+state-one+state-two"))
+        self.assertEqual([call[2] for call in calls], ["state-one", "state-two"])
+        self.assertEqual(calls[0][3:], (0.8, 0.7, {"source": "one"}))
 
     def test_importers_are_local_and_normalized(self) -> None:
         root = Path(self.tmp.name) / "imports"

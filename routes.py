@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import binascii
 import json
 import ntpath
 import tempfile
@@ -16,9 +18,12 @@ try:
     from .image_extractor import (
         clean_positive_prompt,
         extract_prompt_from_metadata,
+        list_vision_models,
         parse_prompt_sections,
+        parse_structured_vision_response,
         query_vision_api,
         suggest_entry_name,
+        structured_vision_to_sections,
     )
     from .image_store import MAX_IMAGE_SIZE, ImageStore
     from .importers import MAX_IMPORT_FILE_SIZE, MAX_IMPORT_TOTAL_SIZE, ImporterError, discover_installed_sources, parse_source, parse_staged_files, summarize_records
@@ -39,9 +44,12 @@ except ImportError:  # direct source import for hermetic tests
     from image_extractor import (
         clean_positive_prompt,
         extract_prompt_from_metadata,
+        list_vision_models,
         parse_prompt_sections,
+        parse_structured_vision_response,
         query_vision_api,
         suggest_entry_name,
+        structured_vision_to_sections,
     )
     from image_store import MAX_IMAGE_SIZE, ImageStore
     from importers import MAX_IMPORT_FILE_SIZE, MAX_IMPORT_TOTAL_SIZE, ImporterError, discover_installed_sources, parse_source, parse_staged_files, summarize_records
@@ -72,11 +80,56 @@ class PayloadTooLargeError(ValueError):
     pass
 
 
+def _parse_force_vision(value: Any, *, multipart: bool) -> bool:
+    """Parse the explicit vision-extraction intent without truthiness traps."""
+
+    if value is None:
+        return False
+    if multipart:
+        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+            return value.strip().lower() == "true"
+    elif isinstance(value, bool):
+        return value
+    raise ValidationError("force_vision must be a boolean (or multipart 'true'/'false')")
+
+
+def _decode_image_base64(value: Any) -> bytes:
+    """Decode a JSON image payload with strict validation and size limits."""
+
+    if not isinstance(value, str) or not value:
+        raise ValidationError("image_base64 must be a non-empty base64 string")
+
+    encoded = value
+    if "," in encoded:
+        prefix, encoded = encoded.split(",", 1)
+        if not prefix.lower().startswith("data:"):
+            raise ValidationError("image_base64 must be valid base64 or a data URL")
+    if not encoded:
+        raise ValidationError("image_base64 must be a non-empty base64 string")
+
+    # Reject an over-limit payload before decoding it into memory. The upper
+    # bound is the canonical base64 size for MAX_IMAGE_SIZE bytes.
+    max_encoded_size = ((MAX_IMAGE_SIZE + 2) // 3) * 4
+    if len(encoded) > max_encoded_size:
+        raise PayloadTooLargeError("image exceeds the 8 MiB limit")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValidationError("image_base64 must be valid base64") from exc
+    if not image_bytes:
+        raise ValidationError("image_base64 must decode to image data")
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        raise PayloadTooLargeError("image exceeds the 8 MiB limit")
+    return image_bytes
+
+
 def _json_error(message: str, status: int) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
 
 def _error_response(exc: Exception) -> web.Response:
+    if isinstance(exc, web.HTTPRequestEntityTooLarge):
+        return _json_error("request body exceeds the 8 MiB image limit", 413)
     if isinstance(exc, DuplicateNameError):
         return _json_error(str(exc) or "duplicate name", 409)
     if isinstance(exc, (EntryNotFoundError, CategoryNotFoundError, FolderNotFoundError, ImageNotFoundError, FileNotFoundError)):
@@ -96,6 +149,18 @@ def _error_response(exc: Exception) -> web.Response:
     if isinstance(exc, LibraryError):
         return _json_error(str(exc) or "prompt library request failed", 500)
     return _json_error("prompt library request failed", 500)
+
+
+def _available_lora_names() -> list[str]:
+    """Return ComfyUI's configured LoRA paths without making it a test dependency."""
+
+    try:
+        import folder_paths  # type: ignore
+
+        values = folder_paths.get_filename_list("loras")
+    except (ImportError, AttributeError, KeyError, OSError, RuntimeError, TypeError):
+        return []
+    return sorted({value for value in values if isinstance(value, str) and value.strip()}, key=str.casefold)
 
 
 async def _request_json(request: web.Request) -> Any:
@@ -347,7 +412,7 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
             payload = await _request_json(request)
             if not isinstance(payload, dict):
                 raise ValidationError("request body must be an object")
-            entry = store.create_entry(payload.get("category_id", payload.get("category")), payload.get("name"), payload.get("prompt"), tags=payload.get("tags"), favorite=payload.get("favorite", False), folder_id=payload.get("folder_id"), entry_id=payload.get("id"))
+            entry = store.create_entry(payload.get("category_id", payload.get("category")), payload.get("name"), payload.get("prompt"), tags=payload.get("tags"), loras=payload.get("loras"), favorite=payload.get("favorite", False), folder_id=payload.get("folder_id"), entry_id=payload.get("id"))
             return web.json_response(entry, status=201)
         except Exception as exc:
             return _error_response(exc)
@@ -357,7 +422,7 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
             payload = await _request_json(request)
             if not isinstance(payload, dict):
                 raise ValidationError("request body must be an object")
-            allowed = {key: payload[key] for key in ("name", "prompt", "category_id", "category", "tags", "favorite", "folder_id") if key in payload}
+            allowed = {key: payload[key] for key in ("name", "prompt", "category_id", "category", "tags", "loras", "favorite", "folder_id") if key in payload}
             if "category_id" in allowed and "category" not in allowed:
                 allowed["category"] = allowed.pop("category_id")
             return web.json_response(store.update_entry(_entry_id(request), **allowed))
@@ -369,6 +434,9 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
             return web.json_response(store.delete_entry(_entry_id(request)))
         except Exception as exc:
             return _error_response(exc)
+
+    async def list_loras_v2(request: web.Request) -> web.Response:
+        return web.json_response({"loras": _available_lora_names()})
 
     async def get_image_v2(request: web.Request) -> web.StreamResponse:
         try:
@@ -603,6 +671,7 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
             vision_prompt = ""
             filename = ""
             image_bytes: bytes | None = None
+            force_vision = False
 
             if request.content_type == "multipart/form-data":
                 reader = await request.multipart()
@@ -633,6 +702,8 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
                         api_model = (await part.text()).strip()
                     elif part_name == "vision_prompt":
                         vision_prompt = (await part.text()).strip()
+                    elif part_name == "force_vision":
+                        force_vision = _parse_force_vision(await part.text(), multipart=True)
                 if image_bytes is None:
                     raise ValidationError("multipart request has no image")
             else:
@@ -644,35 +715,58 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
                 api_model = str(payload.get("api_model", "")).strip()
                 vision_prompt = str(payload.get("vision_prompt", "")).strip()
                 filename = str(payload.get("filename", "")).strip()
+                force_vision = _parse_force_vision(payload.get("force_vision"), multipart=False)
 
                 if "image_base64" in payload:
-                    raw_b64 = payload["image_base64"]
-                    if isinstance(raw_b64, str):
-                        if "," in raw_b64:
-                            raw_b64 = raw_b64.split(",", 1)[1]
-                        image_bytes = base64.b64decode(raw_b64)
+                    image_bytes = _decode_image_base64(payload["image_base64"])
                 elif "image_path" in payload:
-                    p = Path(str(payload["image_path"]))
-                    if p.exists() and p.is_file():
-                        image_bytes = p.read_bytes()
-                        filename = filename or p.name
+                    raise ValidationError("image_path is not accepted; use image_base64 or multipart image")
 
                 if image_bytes is None:
-                    raise ValidationError("image data or image_path is required")
+                    raise ValidationError("image_base64 or multipart image is required")
+
+            try:
+                ImageStore.detect_signature(image_bytes)
+            except ValueError as exc:
+                raise UnsupportedMediaError(str(exc)) from exc
+
+            if force_vision and not api_endpoint:
+                raise ValidationError("api_endpoint is required when force_vision is true")
 
             extracted = ""
             source_mode = "none"
             meta_prompt = extract_prompt_from_metadata(image_bytes)
-            if meta_prompt:
+            if meta_prompt and not force_vision:
                 extracted = meta_prompt
                 source_mode = "metadata"
             elif api_endpoint:
-                extracted = query_vision_api(image_bytes, api_endpoint, api_key, api_model, vision_prompt)
+                try:
+                    extracted = await asyncio.to_thread(
+                        query_vision_api,
+                        image_bytes,
+                        api_endpoint,
+                        api_key,
+                        api_model,
+                        vision_prompt,
+                    )
+                except RuntimeError as exc:
+                    return _json_error(str(exc) or "Vision API request failed", 502)
                 source_mode = "vision"
 
             lib = store.get_library()
             category_names = [cat["name"] for cat in lib.get("categories", [])] if lib.get("version") == 2 else list(CATEGORIES)
-            sections = parse_prompt_sections(extracted, category_names) if extracted else {}
+            structured: dict[str, Any] | None = None
+            if source_mode == "vision" and extracted:
+                try:
+                    structured = parse_structured_vision_response(extracted)
+                except ValueError as exc:
+                    return _json_error(f"Invalid structured vision response: {exc}", 502)
+
+            if structured is not None:
+                extracted = structured["positive_prompt"]
+                sections = structured_vision_to_sections(structured)
+            else:
+                sections = parse_prompt_sections(extracted, category_names) if extracted else {}
             suggested_name = suggest_entry_name(extracted, filename)
 
             return web.json_response({
@@ -681,7 +775,29 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
                 "source": source_mode,
                 "suggested_name": suggested_name,
                 "sections": sections,
+                "structured": structured,
             })
+        except Exception as exc:
+            return _error_response(exc)
+
+    async def vision_models_v2(request: web.Request) -> web.Response:
+        try:
+            payload = await _request_json(request)
+            if not isinstance(payload, dict):
+                raise ValidationError("request body must be an object")
+            api_endpoint = str(payload.get("api_endpoint", "")).strip()
+            api_key = str(payload.get("api_key", "")).strip()
+            if not api_endpoint:
+                raise ValidationError("api_endpoint is required")
+            try:
+                models = await asyncio.to_thread(
+                    list_vision_models,
+                    api_endpoint,
+                    api_key,
+                )
+            except RuntimeError as exc:
+                return _json_error(str(exc) or "Vision API model discovery failed", 502)
+            return web.json_response({"models": models})
         except Exception as exc:
             return _error_response(exc)
 
@@ -696,7 +812,7 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
         "delete_entry_v2": delete_entry_v2, "get_image_v2": get_image_v2, "upload_images_v2": upload_images_v2,
         "replace_images_v2": replace_images_v2, "delete_image_v2": delete_image_v2, "import_sources": import_sources,
         "preview_import_v2": preview_import_v2, "apply_import_v2": apply_import_v2,
-        "extract_image_v2": extract_image_v2,
+        "extract_image_v2": extract_image_v2, "vision_models_v2": vision_models_v2, "list_loras_v2": list_loras_v2,
     }
     # Friendly aliases for integration tests and embedders.
     handlers.update({
@@ -707,6 +823,7 @@ def build_handlers(store: LibraryStore, image_store: ImageStore | None = None) -
         "v2_get_image": get_image_v2, "v2_upload_images": upload_images_v2, "v2_replace_images": replace_images_v2,
         "v2_delete_image": delete_image_v2, "v2_import_sources": import_sources, "v2_preview_import": preview_import_v2,
         "v2_apply_import": apply_import_v2, "v2_extract_image": extract_image_v2,
+        "v2_vision_models": vision_models_v2, "v2_list_loras": list_loras_v2,
     })
     return handlers
 
@@ -747,6 +864,7 @@ def register_routes(store: LibraryStore | None = None, image_store: ImageStore |
     routes.post(f"{BASE_PATH_V2}/entries")(handlers["create_entry_v2"])
     routes.put(f"{BASE_PATH_V2}/entries/{{entry_id}}")(handlers["update_entry_v2"])
     routes.delete(f"{BASE_PATH_V2}/entries/{{entry_id}}")(handlers["delete_entry_v2"])
+    routes.get(f"{BASE_PATH_V2}/loras")(handlers["list_loras_v2"])
     routes.get(f"{BASE_PATH_V2}/entries/{{entry_id}}/images/{{image_id}}")(handlers["get_image_v2"])
     routes.post(f"{BASE_PATH_V2}/entries/{{entry_id}}/images")(handlers["upload_images_v2"])
     routes.put(f"{BASE_PATH_V2}/entries/{{entry_id}}/images")(handlers["replace_images_v2"])
@@ -755,6 +873,7 @@ def register_routes(store: LibraryStore | None = None, image_store: ImageStore |
     routes.post(f"{BASE_PATH_V2}/imports/preview")(handlers["preview_import_v2"])
     routes.post(f"{BASE_PATH_V2}/imports/apply")(handlers["apply_import_v2"])
     routes.post(f"{BASE_PATH_V2}/extract_image")(handlers["extract_image_v2"])
+    routes.post(f"{BASE_PATH_V2}/vision/models")(handlers["vision_models_v2"])
     _REGISTERED_ROUTE_TABLES.add(id(route_table))
     return handlers
 
